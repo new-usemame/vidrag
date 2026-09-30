@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""OCR for photo-post slides (tiktok-rag-asr container). stdin: [{"id", "dir"}]; writes /out/<id>.ocr.txt.
+"""OCR for photo-post slides (vidrag-asr container). stdin: [{"id", "dir"}]; writes /out/<id>.ocr.txt.
 ENGINE=rapidocr (PaddleOCR ONNX; default) or tesseract. One line of text per slide, in slide order.
-rapidocr 3.x (PP-OCRv6, image tiktok-rag-asr:3) when installed, else rapidocr_onnxruntime (PP-OCRv4): v6 stops gluing
+rapidocr 3.x (PP-OCRv6, image vidrag-asr:3) when installed, else rapidocr_onnxruntime (PP-OCRv4): v6 stops gluing
 words together ("helloworld", "TheCafe") at the same speed (2026-09-29 side-by-side, eval/ocr_bench.py)."""
 import glob
 import json

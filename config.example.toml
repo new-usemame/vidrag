@@ -1,0 +1,62 @@
+# vidrag site config: copy to ~/.config/vidrag/config.toml (or point $VIDRAG_CONFIG at it). Nothing here is secret
+# except what the key and token files hold; keep those 0600.
+
+home = "~/vidrag"               # off-switches: <home>/OFF stops the pipeline, <home>/GEMINI_OFF stops the cloud step
+# data = "~/vidrag/data"        # index.db + vectors.npz (both derived: delete them and run `update` + `embed`)
+# models = "~/vidrag/models"    # whisper.cpp + sherpa-onnx + fastembed model files
+# default_collections = ["youtube"]   # what `query` searches when no --collection is given (default: all)
+
+# Each collection is one or more folders of yt-dlp series (<Series>/Season */<name>.info.json + the video), or the
+# series folders themselves. Steps are opt-in per collection and all run in CPU-capped containers:
+#   enrich      the platform's public page (plugin; TikTok: place tag, keywords, stickers, captions)
+#   ocr         text on photo-post slides
+#   diarize     who speaks when
+#   transcribe  Whisper large-v3-turbo
+#   watch       the ONE cloud step: Gemini watches a 1-fps 480p re-encode and describes it (needs a key; costs money)
+# Without steps a collection still gets titles, descriptions, tags, chapters, any subtitle files beside the videos,
+# and local embeddings.
+
+[collections.youtube]
+paths = ["/srv/media/youtube"]  # a folder of channel folders
+exclude = ["TikTok DMs", "TikTok Saved"]   # series folders that belong to another collection
+kind = "YouTube"
+steps = []
+floor_min = 100                 # `check` fails below this many videos (and when the count drops below its peak)
+update_every = 3600             # `pipeline` re-scans this collection when its index is older than this (seconds)
+
+[collections.tiktok]
+paths = ["/srv/media/youtube/TikTok DMs", "/srv/media/youtube/TikTok Saved"]   # earlier paths win duplicate ids
+plugin = "tiktok"
+steps = ["enrich", "ocr", "diarize", "transcribe", "watch"]
+floor_min = 100
+
+[collections.tiktok.tiktok]
+contact = "sam"                 # the other person in the chat: `--from sam` (or `--from them`)
+chat_index = "~/dm-poller/state/chat_index.json"
+backfill_index_size = 0         # the chat's size when the backfill began: later videos get exact share times
+# favs_index = "~/vidrag/data/favs_index.json"   # written by favs/favs.py
+
+[search]
+kw_weight = 0.25                # keyword leg's weight in the fusion with the semantic leg
+# [[search.aliases]]            # concept groups: a generic word also matches its siblings (replaces the built-ins)
+# weight = 1.0
+# words = ["food", "restaurant", "pizza", "bakery"]
+
+[embed]
+image = "vidrag-embed:2"
+model = "google/embeddinggemma-300m"
+model_path = "/models/fastembed/flat/embeddinggemma-300m"
+
+[asr]
+image = "vidrag-asr:3"
+cpus = 4
+
+[gemini]
+model = "gemini-3.5-flash-lite"
+key_file = "~/.config/vidrag/gemini.env"     # GEMINI_API_KEY=… ; no file, no cloud step
+price = [0.30, 2.50]            # $/M input, output tokens, for the spend estimate in `stats`
+
+[api]
+listen = "127.0.0.1:8790"       # a LAN address needs a token
+token_file = "~/.config/vidrag/api-token"
+# url = "http://127.0.0.1:8790" # lets the CLI borrow the running server's warm model (fast semantic search)

@@ -1,0 +1,10 @@
+#!/bin/sh
+# Laptop-side wrapper: the index and all compute live on the server; this forwards the arguments over ssh.
+# Install: ln -sf "<repo>/vidrag-remote" ~/.local/bin/vidrag (a link named tiktok-rag runs the old command), and put
+# ssh = "user@server" in ~/.config/vidrag/config.toml (or VIDRAG_SSH=user@server in the environment).
+name=$(basename "$0"); [ "$name" = vidrag-remote ] && name=vidrag
+[ -n "$VIDRAG_SSH" ] || VIDRAG_SSH=$(sed -n 's/^ssh *= *"\(.*\)".*/\1/p' "$HOME/.config/vidrag/config.toml" 2>/dev/null)
+[ -n "$VIDRAG_SSH" ] || { echo "$name: set ssh = \"user@server\" in ~/.config/vidrag/config.toml" >&2; exit 64; }
+args=""
+for a in "$@"; do args="$args '$(printf %s "$a" | sed "s/'/'\\\\''/g")'"; done
+exec ssh -o ConnectTimeout=10 -o BatchMode=yes "$VIDRAG_SSH" "~/.local/bin/$name$args"

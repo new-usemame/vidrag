@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Retrieval bake-off for tiktok-rag on the real index (runs on the server, drives the embed container).
+"""Retrieval bake-off for vidrag on the real index (runs on the server, drives the embed container).
 
   eval_retrieval.py embed <tag>       embed every video with EMBEDDERS[tag] into eval/vec-<tag>.npz (incremental)
   eval_retrieval.py run               keyword + each embedder + RRF fusions + rerankers -> eval/runs.json, eval/pool.json
@@ -20,7 +20,7 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent))
-import tiktok_rag as t  # noqa: E402
+import vidrag as t  # noqa: E402
 
 QUERIES = json.loads(next((HERE / f).read_text() for f in ("queries.json", "queries.example.json")
                            if (HERE / f).exists()))
@@ -36,14 +36,14 @@ RERANKERS = {
     "jina2": "jinaai/jina-reranker-v2-base-multilingual",
 }
 RERANK_DEPTH = 30
-IMAGE = "tiktok-rag-embed:2"
+IMAGE = t.EMBED_IMAGE
 
 
 def container(mode, payload, env, timeout=6 * 3600):
     cmd = ["docker", "run", "--rm", "-i", "--cpus=3", "--memory=4g", "--cpu-shares=128", "--user", "1000:1000",
            "-e", "HOME=/tmp", "-e", "THREADS=3", *sum((["-e", f"{k}={v}"] for k, v in env.items()), []),
            "-v", f"{t.MODELS / 'fastembed'}:/models/fastembed", "-v", f"{HERE}:/data",
-           "-v", f"{HERE / 'embed.py'}:/asr/embed.py:ro", IMAGE, "python", "/asr/embed.py", mode]
+           "-v", f"{HERE.parent / 'asr' / 'embed.py'}:/asr/embed.py:ro", IMAGE, "python", "/asr/embed.py", mode]
     p = subprocess.run(cmd, input=json.dumps(payload), capture_output=True, text=True, timeout=timeout)
     if p.returncode:
         raise SystemExit(f"{mode} {env}: exit {p.returncode}: {p.stderr.strip()[-600:]}")

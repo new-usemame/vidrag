@@ -1,4 +1,4 @@
-"""Score the production `tiktok-rag query` (all its rules) on the judged queries; unjudged results count as 0."""
+"""Score the production `tiktok-rag query` (the chat collection) (all its rules) on the judged queries; unjudged results count as 0."""
 import json, subprocess, sys
 from pathlib import Path
 HERE = Path(__file__).resolve().parent

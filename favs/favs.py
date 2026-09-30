@@ -16,7 +16,7 @@ New ids go to MeTube (folder "TikTok Saved"), newest favorite first, MAX_SUBMIT 
 Your handle: $FAVS_HANDLE or the first line of /data/favs_handle.
 
 Exit codes: 0 ok · 3 not logged in / wrong account / no handle configured · 5 MeTube unreachable · 6 browser (CDP) unreachable ·
-7 Favorites tab or its API not found (markup changed). Off-switch: /data/../FAVS_OFF (host ~/tiktok-rag/FAVS_OFF).
+7 Favorites tab or its API not found (markup changed). Off-switch: /data/../FAVS_OFF (the host folder that holds data/).
 """
 import json, os, re, sys, threading, time, urllib.request
 from datetime import datetime, timezone

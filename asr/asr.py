@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Batch speech-to-text + speaker turns for tiktok-rag, run inside the tiktok-rag-asr container.
+"""Batch speech-to-text + speaker turns for vidrag, run inside the vidrag-asr container.
 
 One process loads the models once and handles many videos:
   silero VAD  -> speech segments (music/silence dropped, so nothing is hallucinated over a soundtrack)

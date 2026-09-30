@@ -1,18 +1,20 @@
 #!/usr/bin/env python3
-"""Local text embeddings and reranking for tiktok-rag (runs in the tiktok-rag-embed container; ONNX on CPU, no
-network after the one-time model download into /models/fastembed).
+"""Local text embeddings and reranking for vidrag (runs in the vidrag-embed container; ONNX on CPU, no network
+after the one-time model download into /models/fastembed).
 
   embed.py index   stdin {"docs": [{"id", "text"}]}           -> updates $STORE (only docs whose text changed)
-  embed.py query   stdin {"q": "...", "k": 50}                -> stdout [[id, cosine], ...]
+  embed.py query   stdin {"q": "...", "k": 50, "ids": [...]}  -> stdout [[id, cosine], ...] (among ids, if given)
   embed.py rank    stdin {"qs": ["...", ...], "k": 50}        -> stdout [[[id, cosine], ...], ...]  (one load, many queries)
   embed.py rerank  stdin {"q": "...", "docs": [{"id", "text"}]} -> stdout [[id, score], ...] best first ($RERANKER)
 
 EMBED_MODEL picks the embedder; each model family wants its own query/document prefixes (PREFIXES).
+`vidrag serve` imports this module and keeps a Searcher (the model, loaded once) for its whole life.
 """
 import hashlib
 import json
 import os
 import sys
+import threading
 
 import numpy as np
 
@@ -22,7 +24,7 @@ RERANKER = os.environ.get("RERANKER", "")
 THREADS = int(os.environ.get("THREADS", "4"))
 MAX_CHARS = 6000  # ~1.5k tokens: caption + metadata + most of a transcript
 RERANK_CHARS = int(os.environ.get("RERANK_CHARS", "2000"))  # rerankers are O(len): caption, place, first ~500 words
-QWEN_TASK = "Given a search query about short social videos, retrieve the videos whose content matches the query"
+QWEN_TASK = "Given a search query about videos, retrieve the videos whose content matches the query"
 # (document prefix, query prefix) — from each model card
 PREFIXES = {
     "nomic": ("search_document: ", "search_query: "),
@@ -79,6 +81,44 @@ def reranker():
     return lambda q, ts: list(m.rerank(q, ts, batch_size=4))
 
 
+def top_k(mat, ids, qv, k):
+    sims = mat @ unit(qv)
+    top = np.argsort(-sims)[:k]
+    return [[str(ids[j]), round(float(sims[j]), 4)] for j in top]
+
+
+class Searcher:
+    """The query model, loaded once, over the vector store (re-read whenever the file changes)."""
+
+    def __init__(self):
+        self.m, self.qp = model(), prefixes()[1]
+        self.lock, self.stamp, self.ids, self.mat, self.pos = threading.Lock(), None, [], None, {}
+
+    def refresh(self):
+        try:
+            st = os.stat(STORE)
+            stamp = (st.st_mtime_ns, st.st_size)
+        except FileNotFoundError:
+            stamp = None
+        if stamp != self.stamp:
+            have = load()
+            self.ids = [str(i) for i in have]
+            self.pos = {i: n for n, i in enumerate(self.ids)}
+            self.mat = np.stack([have[i][1] for i in have]) if have else None
+            self.stamp = stamp
+
+    def query(self, q, k=50, ids=None):
+        with self.lock:
+            self.refresh()
+            if self.mat is None:
+                return []
+            qv = next(iter(self.m.embed([self.qp + q])))
+            if ids is None:
+                return top_k(self.mat, self.ids, qv, k)
+            rows = [self.pos[i] for i in ids if i in self.pos]
+            return top_k(self.mat[rows], [self.ids[r] for r in rows], qv, k) if rows else []
+
+
 def main():
     mode = sys.argv[1]
     req = json.load(sys.stdin)
@@ -113,12 +153,14 @@ def main():
         print(json.dumps([[] for _ in qs] if mode == "rank" else []))
         return
     ids = list(have)
+    if req.get("ids") is not None:
+        allow = set(req["ids"])
+        ids = [i for i in ids if i in allow]
+    if not ids:
+        print(json.dumps([[] for _ in qs] if mode == "rank" else []))
+        return
     mat = np.stack([have[i][1] for i in ids])
-    res = []
-    for qv in m.embed([qp + q for q in qs]):
-        sims = mat @ unit(qv)
-        top = np.argsort(-sims)[: req.get("k", 50)]
-        res.append([[ids[j], round(float(sims[j]), 4)] for j in top])
+    res = [top_k(mat, ids, qv, req.get("k", 50)) for qv in m.embed([qp + q for q in qs])]
     print(json.dumps(res if mode == "rank" else res[0]))
 
 
