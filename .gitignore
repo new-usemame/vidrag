@@ -1,0 +1,17 @@
+# Anything that describes your own archive stays out of git.
+MISSION.md
+completed.log
+data/
+models/
+eval/queries.json
+eval/qrels.json
+eval/pool.json
+eval/runs.json
+eval/unjudged.json
+eval/*.npz
+eval/*.log
+favs/probe*.py
+__pycache__/
+*.pyc
+*.bak*
+.DS_Store

@@ -1,0 +1,9 @@
+#!/bin/sh
+# Laptop-side wrapper: the index and all compute live on the server; this just forwards the arguments over ssh.
+# Install: ln -sf "<repo>/bin-tiktok-rag" ~/.local/bin/tiktok-rag, and put TIKTOK_RAG_SSH=user@server in
+# ~/.config/tiktok-rag/config.env (or the environment).
+[ -n "$TIKTOK_RAG_SSH" ] || TIKTOK_RAG_SSH=$(sed -n 's/^TIKTOK_RAG_SSH=//p' "$HOME/.config/tiktok-rag/config.env" 2>/dev/null)
+[ -n "$TIKTOK_RAG_SSH" ] || { echo "tiktok-rag: set TIKTOK_RAG_SSH=user@server (see bin-tiktok-rag)" >&2; exit 64; }
+args=""
+for a in "$@"; do args="$args '$(printf %s "$a" | sed "s/'/'\\\\''/g")'"; done
+exec ssh -o ConnectTimeout=10 -o BatchMode=yes "$TIKTOK_RAG_SSH" "~/.local/bin/tiktok-rag$args"
