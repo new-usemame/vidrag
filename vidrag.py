@@ -1685,6 +1685,15 @@ def main(argv=None, compat=None):
 
     if args.cmd == "embed":
         return cmd_embed(args)
+    if args.cmd == "watch":
+        # The pipeline's own watch step takes this lock too, so a hand-started backlog run and the pipeline never
+        # send the same video to Gemini twice (2026-09-30: they ran side by side for six hours).
+        lock = single_instance("watch")
+        if lock is None:
+            print("watch: another watch run is in progress, skipping")
+            return 0
+        with lock:
+            return cmd_watch(args)
     if args.cmd in ("transcribe", "diarize", "enrich", "pipeline", "ocr", "watch"):
         lock = single_instance(args.cmd)
         if lock is None:

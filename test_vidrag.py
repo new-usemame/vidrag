@@ -512,6 +512,15 @@ class RobustnessTest(Base):
         self.assertEqual(db.execute("select count(*) from videos where collection='youtube'").fetchone()[0], 0)
         self.assertEqual(db.execute("select count(*) from videos where collection='tiktok'").fetchone()[0], 5)
 
+    def test_hand_started_watch_yields_to_a_running_one(self):
+        held = self.t.single_instance("watch")
+        self.addCleanup(held.close)
+        calls = []
+        self.t.cmd_watch = lambda a: calls.append(a) or 0
+        code, out = self.vidrag("watch")
+        self.assertEqual((code, calls), (0, []))
+        self.assertIn("another watch run", out)
+
     def test_text_output_with_float_durations(self):
         self.write_yt(self.tmp / "youtube", "Primer", "cccccccccc1", "Simulating an epidemic", "Agents.", "20200101",
                       duration=1203.5)
