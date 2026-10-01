@@ -1373,7 +1373,7 @@ API_LISTEN = _API.get("listen", "127.0.0.1:8790")
 API_TOKEN_FILE = expand(_API.get("token_file", HOME / ".config/vidrag/api-token"))
 API_URL = _API.get("url", "").rstrip("/")  # the CLI borrows a running server's warm model for the semantic leg
 MAX_LIMIT = 100
-MAX_BODY = 64 * 1024
+MAX_BODY = 4 << 20  # /v1/embed carries the scope's id allowlist: ~22 bytes a video, so this is ~180k videos
 
 
 def api_token():

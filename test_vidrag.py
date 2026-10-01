@@ -579,9 +579,34 @@ class ApiTest(Base):
             self.assertIn(b"vidrag", r.read())
 
     def test_body_is_not_read_without_a_token_and_is_capped(self):
-        big = {"q": "x" * (70 * 1024)}
-        self.assertEqual(self.call("/v1/search", big, token="wrong")[0], 401)
-        self.assertEqual(self.call("/v1/search", big)[0], 400)
+        import http.client
+        from urllib.parse import urlsplit
+
+        def declared(token):  # announce a 5 MB body, send none: the server must answer from the headers alone
+            u = urlsplit(self.base)
+            c = http.client.HTTPConnection(u.hostname, u.port, timeout=10)
+            c.putrequest("POST", "/v1/search")
+            c.putheader("Authorization", f"Bearer {token}")
+            c.putheader("Content-Length", str(5 << 20))
+            c.endheaders()
+            code = c.getresponse().status
+            c.close()
+            return code
+        self.assertEqual(declared("wrong"), 401)
+        self.assertEqual(declared("s3cret"), 400)
+
+    def test_embed_takes_a_large_collections_id_allowlist(self):
+        seen = {}
+
+        class Stub:
+            def query(self, q, k, ids):
+                seen["n"] = len(ids)
+                return [[ids[0], 0.9]]
+        self.t.SEARCHER = Stub()
+        ids = [f"{i:019d}" for i in range(20000)]  # bigger than a 6k-video YouTube tree
+        code, d = self.call("/v1/embed", {"q": "dog", "k": 5, "ids": ids})
+        self.assertEqual(code, 200)
+        self.assertEqual(seen["n"], 20000)
 
     def test_semantic_failure_degrades_to_keyword(self):
         class Broken:
