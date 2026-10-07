@@ -6,7 +6,7 @@ the matching videos, with the file on disk and a link to the original page, from
 It indexes what yt-dlp based downloaders (MeTube, ytdl-sub, plain yt-dlp) already leave on disk:
 `<Series>/Season */<name>.info.json` beside each video. That's the same layout Jellyfin and Plex read. Point it at a
 YouTube tree, a TikTok chat archive, or anything else yt-dlp can download. Everything runs on your own server; the
-only optional cloud step (Gemini watching a video) is off unless you turn it on for a collection and give it a key.
+optional cloud steps (Gemini watching a video, an LLM reranking search results) are off unless you give them a key.
 
 ## What it builds per video
 
@@ -20,6 +20,10 @@ only optional cloud step (Gemini watching a video) is off unless you turn it on 
 | `ocr` | text on photo-post slides (RapidOCR) | local, CPU-capped container |
 | `watch` | **optional cloud step:** Gemini watches a 1-fps 480p re-encode and describes it | Google Gemini API |
 
+At query time, an optional `[rerank]` model (any OpenRouter chat model with a zero-data-retention endpoint) reads
+short text cards of the local search's candidates: it reorders the top 30, and for `--sort newest|oldest` it decides
+which candidates match at all, so the answer is every match by date rather than the top few. `--local` skips it.
+
 `update` and `embed` run for every collection. The other steps run only for the collections that list them, so a
 large YouTube tree can stay metadata-only while a small chat archive gets everything.
 
@@ -30,8 +34,12 @@ step, newest video first, and re-scans collections whose `update_every` has pass
 its rows until `vidrag update --prune`.
 
 On a judged set of about a thousand short videos, EmbeddingGemma beat nomic-embed clearly and Gemini's descriptions
-added a few more points of nDCG@10. The cross-encoder rerankers we tried scored lower and took most of a minute per
-query on a 4-core CPU.
+added a few more points of nDCG@10. The local cross-encoder rerankers we tried scored lower and took most of a minute
+per query on a 4-core CPU. An LLM reranking the top 30 over OpenRouter raised nDCG@10 from 0.77 to about 0.92 on the
+same set (gemini-3.8-flash at low effort: 2.4 s, about 0.6 cents a query; gpt-6-luna 0.91 at a fifth of the cost).
+For sorted queries, gpt-6-luna at medium effort grading the candidate pool kept 95% of the clearly relevant judged
+videos, 54% of the partly relevant and 2% of the irrelevant (about 0.6 cents and 15 s for 160 candidates); no local
+cosine cutoff came close (0.12 from the best hit kept about 75% of the relevant at 70% precision).
 
 ## Setup
 
@@ -57,7 +65,7 @@ vidrag pipeline                   # run each collection's steps, newest first
 ```sh
 vidrag query "places to eat in brooklyn"
 vidrag query "how does a cassette adapter work" -c youtube --series "Technology Connections"
-vidrag query "pasta" -c tiktok --from them --since 2026-06 --newest
+vidrag query "pasta" -c tiktok --from them --since 2026-06 --sort newest   # every match, newest first
 vidrag recent 20 -c youtube --json
 vidrag show <id>                  # every field, full transcript (JSON)
 vidrag collections                # what can be searched, with series and counts (JSON)
@@ -92,7 +100,7 @@ curl -s -H "Authorization: Bearer $T" -d '{"q": "sourdough", "collection": "yout
 
 | Route | What |
 |---|---|
-| `GET /v1/search?q=…` or `POST /v1/search {"q": …}` | search; filters `collection`, `series`, `author`, `since`, `until`, `from`, `source`, `limit`, `mode`, `newest`, `all` |
+| `GET /v1/search?q=…` or `POST /v1/search {"q": …}` | search; filters `collection`, `series`, `author`, `since`, `until`, `from`, `source`, `limit`, `mode`, `all`; `sort=newest\|oldest` returns every match by date (`newest=1` is the same); `local=1` skips the LLM step |
 | `GET /v1/recent?n=…` | newest first, same filters |
 | `GET /v1/videos/{id}` | every field, full transcript |
 | `GET /v1/collections` | collections, their series and counts |

@@ -56,6 +56,20 @@ model = "gemini-3.5-flash-lite"
 key_file = "~/.config/vidrag/gemini.env"     # GEMINI_API_KEY=… ; no file, no cloud step
 price = [0.30, 2.50]            # $/M input, output tokens, for the spend estimate in `stats`
 
+# Optional: an LLM reorders the top search candidates and, for a date-sorted query (--sort newest), picks which
+# candidates match at all. Cards (caption, tags, place, the watch description, on-screen text, start of the speech)
+# go to OpenRouter with zero data retention required per request; give the key a ZDR-only guardrail too.
+# Off: leave model empty or remove the key file; per query: --local / local=true.
+[rerank]
+model = ""                      # reranker, e.g. "google/gemini-3.8-flash"
+effort = ""                     # reasoning effort for it, e.g. "low"; empty = the model's default
+filter_model = ""               # grader for sorted queries; empty = same as model (e.g. "openai/gpt-6-luna")
+filter_effort = ""              # e.g. "medium"
+key_file = "~/.config/vidrag/openrouter.env"   # OPENROUTER_API_KEY=…
+top = 30                        # candidates reordered for a relevance query
+pool = 160                      # candidates judged for a sorted query (every exact keyword hit is added)
+speech = true                   # include the start of the transcript in each card
+
 [api]
 listen = "127.0.0.1:8790"       # a LAN address needs a token
 token_file = "~/.config/vidrag/api-token"

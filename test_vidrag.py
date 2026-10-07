@@ -316,6 +316,28 @@ class TikTokCompatTest(Base):
         stats = json.loads(self.run_cli("stats")[1])["gemini"]
         self.assertEqual((stats["sidecars"], stats["input_tokens"], stats["output_tokens"]), (2, 1800, 120))
 
+    def test_recitation_block_is_retried_once_asking_for_a_paraphrase(self):
+        self.run_cli("update", "-q")
+        t = self.t
+        os.environ["GEMINI_API_KEY"] = "fake"
+        self.addCleanup(os.environ.pop, "GEMINI_API_KEY", None)
+        t.watch_clip = lambda mp4, out: b"clip"
+        sent = []
+        def post(body, key):
+            sent.append(json.loads(json.dumps(body)))
+            if len(sent) == 1:
+                return {"candidates": [{"finishReason": "RECITATION"}], "usageMetadata": {"promptTokenCount": 700}}
+            return {"candidates": [{"content": {"parts": [{"text": json.dumps({"summary": "A singer.", "tags": ["song"]})}]}}],
+                    "usageMetadata": {"promptTokenCount": 800, "candidatesTokenCount": 20}}
+        t.gemini_post = post
+        self.assertEqual(t.cmd_watch(ns(max=1, quiet=True)), 0)
+        self.assertEqual(len(sent), 2)
+        self.assertIn("Do not quote song lyrics", sent[1]["contents"][0]["parts"][1]["text"])
+        self.assertNotIn("on_screen_text", sent[1]["generationConfig"]["responseJsonSchema"]["properties"])
+        self.assertIn("on_screen_text", t.GEMINI_SCHEMA["properties"])  # the shared schema is untouched
+        side = json.loads((self.nas / "TikTok DMs/.transcripts/4.gemini.json").read_text())
+        self.assertEqual((side["description"].split("\n")[0], side["usage"]["promptTokenCount"]), ("A singer.", 1500))
+
     def test_pipeline_stops_when_only_a_held_watch_run_remains(self):
         self.run_cli("update", "-q")
         t = self.t
@@ -346,6 +368,88 @@ class TikTokCompatTest(Base):
         self.assertEqual(text, "S1: Welcome back.\nS2: Thanks for having me. Sure.\nS1: So, bananas.")
         text, n = self.t.speaker_transcript(w, {"n_speakers": 1, "turns": [[0, 9, 0]]})
         self.assertEqual(text, "Welcome back. Thanks for having me. Sure. So, bananas.")
+
+
+class RerankTest(Base):
+    """The optional LLM step: rerank the top candidates, or pick every match for a date-sorted query."""
+
+    def setUp(self):
+        super().setUp()
+        os.environ["OPENROUTER_API_KEY"] = "test-key"  # never the real key: rerank_post is always faked here
+        self.configure(extra='\n[rerank]\nmodel = "test/model"\nkey_file = "/no/such/file"\n')
+        self.run_cli("update", "-q")
+        self.t.embed_query = lambda text, k=200, ids=None: [["2", 0.60], ["1", 0.58], ["3", 0.40], ["4", 0.30]]
+        self.sent = []
+
+    def tearDown(self):
+        os.environ.pop("OPENROUTER_API_KEY", None)
+
+    def fake(self, reply):
+        def post(body):
+            self.sent.append(body)
+            return reply(body["messages"][0]["content"]) if callable(reply) else reply
+        self.t.rerank_post = post
+
+    def ids(self, *argv):
+        return [r["id"] for r in json.loads(self.vidrag("query", *argv, "--json")[1])]
+
+    def test_rerank_reorders_the_top_and_requires_zdr(self):
+        self.fake(lambda prompt: json.dumps({"order": [2, 0]}))  # local order is 2,1,3,4: put 3 first, then 2
+        self.assertEqual(self.ids("pigeons", "-c", "tiktok")[:4], ["3", "2", "1", "4"])
+        self.assertEqual(self.sent[0]["provider"], {"zdr": True, "data_collection": "deny"})
+        self.assertEqual(self.sent[0]["model"], "test/model")
+        self.assertNotIn("reasoning", self.sent[0])  # no effort configured
+        self.assertIn("[0] caption: pigeons eat seeds", self.sent[0]["messages"][0]["content"])
+
+    def test_failure_or_local_keeps_the_local_order(self):
+        def boom(body):
+            raise OSError("down")
+        self.t.rerank_post = boom
+        self.assertEqual(self.ids("pigeons", "-c", "tiktok")[:2], ["2", "1"])
+        self.fake(json.dumps({"order": [3, 2, 1, 0]}))
+        self.assertEqual(self.ids("pigeons", "-c", "tiktok", "--local")[:2], ["2", "1"])
+        self.assertEqual(self.sent, [])
+
+    def test_sort_newest_returns_every_match_by_date(self):
+        # the LLM grades the dumpling and soup videos as matches; the result is those, newest first
+        def grade(prompt):  # cards about dumplings or soup match; everything else is graded 0
+            cards = prompt.split("\n\n[")[1:]
+            return json.dumps({"grades": {c.split("]")[0]: int(any(w in c.split("\n")[0] for w in ("dumplings", "soup")))
+                                          for c in cards}})
+        self.fake(grade)
+        self.t.FILTER_MODEL, self.t.FILTER_EFFORT = "test/filter", "medium"
+        got = self.ids("food", "-c", "tiktok", "--sort", "newest")
+        self.assertEqual((self.sent[0]["model"], self.sent[0]["reasoning"]), ("test/filter", {"effort": "medium"}))
+        self.assertEqual(got, ["3", "1"])  # chat order: 3 was shared after 1
+        self.assertEqual(self.ids("food", "-c", "tiktok", "--sort", "oldest"), ["1", "3"])
+        self.assertEqual(self.ids("food", "-c", "tiktok", "--newest"), ["3", "1"])
+
+    def test_sort_without_llm_uses_exact_hits_and_close_semantic_hits(self):
+        self.fake(json.dumps({"grades": {}}))
+        # "dumplings" is only in 1 (exact); semantic best is 2 at 0.60, 1 at 0.58 is in the window, 3 at 0.40 is not
+        got = self.ids("dumplings", "-c", "tiktok", "--sort", "newest", "--local")
+        self.assertEqual(got, ["2", "1"])
+        self.assertEqual(self.sent, [])
+
+    def test_a_failed_filter_batch_does_not_return_a_partial_set(self):
+        calls = []
+        def post(body):  # the batch holding video 3 fails on both tries; the other batch succeeds
+            calls.append(1)
+            if "cozy soup" in body["messages"][0]["content"]:
+                raise OSError("down")
+            return json.dumps({"grades": {"0": 2, "1": 2}})
+        self.t.RERANK_BATCH = 2  # two batches over the four candidates
+        self.t.rerank_post = post
+        rc, out = self.vidrag("query", "dumplings", "-c", "tiktok", "--sort", "newest", "--json")
+        self.assertEqual([r["id"] for r in json.loads(out)], ["2", "1"])  # the local set, not one batch's pick
+        self.assertEqual(len(calls), 3)  # one good batch, and the failing one tried twice
+
+    def test_api_sort_param(self):
+        o = self.t.opts_from({"q": "x", "sort": "oldest"})
+        self.assertEqual((o.sort, o.local), ("oldest", False))
+        self.assertEqual(self.t.opts_from({"q": "x", "newest": "1", "local": "true"}).sort, "newest")
+        with self.assertRaises(ValueError):
+            self.t.opts_from({"q": "x", "sort": "random"})
 
 
 class MultiCollectionTest(Base):

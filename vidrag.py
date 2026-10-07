@@ -858,6 +858,15 @@ def describe(d):
     return "\n".join(p for p in parts if p)
 
 
+RECITATION_NOTE = ("\nDo not quote song lyrics, scripts or any long passage; paraphrase in your own words and keep "
+                   "quotations to a few words.")
+
+
+def finish_reason(r):
+    cands = r.get("candidates") or []
+    return (r.get("promptFeedback") or {}).get("blockReason") or (cands[0].get("finishReason") if cands else "empty")
+
+
 def watch_one(mp4, tdir, vid, caption, key, kind=""):
     """Gemini watches one video -> <id>.gemini.json {description, raw, usage} or {error} (retried weekly)."""
     import base64
@@ -873,6 +882,16 @@ def watch_one(mp4, tdir, vid, caption, key, kind=""):
         "generationConfig": {"mediaResolution": "MEDIA_RESOLUTION_LOW", "responseMimeType": "application/json",
                              "responseJsonSchema": GEMINI_SCHEMA, "thinkingConfig": {"thinkingLevel": "LOW"}}}
     r = gemini_post(body, key)
+    if finish_reason(r) == "RECITATION":
+        # Gemini withholds output that would reproduce copyrighted text (song lyrics, a script) verbatim. Ask again for
+        # a paraphrase, without the field that invites quoting.
+        body["contents"][0]["parts"][1]["text"] += RECITATION_NOTE
+        body["generationConfig"]["responseJsonSchema"] = {**GEMINI_SCHEMA, "properties": {
+            k: v for k, v in GEMINI_SCHEMA["properties"].items() if k != "on_screen_text"}}
+        spent = r.get("usageMetadata") or {}
+        r = gemini_post(body, key)
+        r["usageMetadata"] = {k: v + spent.get(k, 0) if isinstance(v, int) else v  # both calls count in `stats`
+                              for k, v in (r.get("usageMetadata") or {}).items()}
     rec = {"id": vid, "model": r.get("modelVersion") or GEMINI_MODEL, "fetched": int(time.time()),
            "clip_bytes": len(clip), "usage": r.get("usageMetadata") or {}}
     cands = r.get("candidates") or []
@@ -881,8 +900,7 @@ def watch_one(mp4, tdir, vid, caption, key, kind=""):
         raw = json.loads(text)
         rec.update(raw=raw, description=describe(raw))
     except ValueError:
-        why = (r.get("promptFeedback") or {}).get("blockReason") or (cands[0].get("finishReason") if cands else "empty")
-        rec["error"] = f"no JSON: {why}"
+        rec["error"] = f"no JSON: {finish_reason(r)}"
     atomic_write(tdir / f"{vid}.gemini.json", json.dumps(rec, ensure_ascii=False))
     return "error" not in rec, rec.get("error") or f"{len(rec['description'])} chars"
 
@@ -1034,10 +1052,159 @@ def scope_sql(o, alias="v"):
     return f"{alias}.collection in ({qmarks(o.collections)})", list(o.collections)
 
 
+# ---------------------------------------------------------------- LLM rerank and relevance filter (optional cloud step)
+# A capable LLM reads short cards (caption, tags, place, the watch step's description, on-screen text and the start of
+# the speech) of the local search's candidates: it reorders the top ones, and for a sorted query (newest first) it
+# decides which candidates match at all. Sent over OpenRouter with zero data retention required per request; the key
+# should also carry a ZDR-only guardrail. Off: leave [rerank] model empty, delete the key file, or pass local=true.
+# Any failure falls back to the local order, never fails the query.
+
+_R = CFG.get("rerank", {})
+RERANK_MODEL = _R.get("model", "")  # reorders the top of a relevance query
+RERANK_EFFORT = _R.get("effort", "")  # OpenRouter reasoning effort ("low", "medium"…); empty = the model's default
+FILTER_MODEL = _R.get("filter_model", RERANK_MODEL)  # grades the pool of a date-sorted query
+FILTER_EFFORT = _R.get("filter_effort", RERANK_EFFORT if FILTER_MODEL == RERANK_MODEL else "")
+RERANK_KEY_FILE = expand(_R.get("key_file", HOME / ".config/vidrag/openrouter.env"))
+RERANK_URL = _R.get("url", "https://openrouter.ai/api/v1/chat/completions")
+RERANK_TOP = int(_R.get("top", 30))  # candidates reordered for a relevance query
+RERANK_POOL = int(_R.get("pool", 160))  # candidates the filter reads for a sorted query
+RERANK_BATCH = int(_R.get("batch", 40))  # cards per filter request; batches run in parallel
+RERANK_SPEECH = bool(_R.get("speech", True))  # include the start of the transcript in each card
+RERANK_TIMEOUT = float(_R.get("timeout", 60))
+# Without the LLM, a sorted query keeps semantic hits within this cosine of the best one (judged set, 2026-10-06:
+# 0.12 kept precision ~0.70 at recall ~0.75; no local cutoff does both well, which is why the filter exists).
+LOCAL_WINDOW = float(_R.get("local_window", 0.12))
+
+
+def rerank_key():
+    if os.environ.get("OPENROUTER_API_KEY"):
+        return os.environ["OPENROUTER_API_KEY"].strip()
+    try:
+        for ln in RERANK_KEY_FILE.read_text().splitlines():
+            if ln.startswith("OPENROUTER_API_KEY="):
+                return ln.split("=", 1)[1].strip()
+    except OSError:
+        pass
+    return None
+
+
+def rerank_ready():
+    return bool(RERANK_MODEL and rerank_key())
+
+
+def rerank_card(i, r):
+    keys = r.keys()
+    parts = [f"[{i}] caption: {(r['caption'] or r['title'] or '')[:250]}", f"author: {r['author'] or ''}"]
+    for label, col, n in (("tags", "hashtags", 120), ("place", "location", 120), ("video shows", "visual", 450),
+                          ("on-screen text", "ocr", 150)):
+        if col in keys and r[col]:
+            parts.append(f"{label}: {' '.join(r[col].split())[:n]}")
+    if RERANK_SPEECH:
+        speech = r["transcript_whisper"] or r["transcript_subs"] or ""
+        if speech:
+            parts.append(f"speech: {' '.join(speech.split())[:350]}")
+    return "\n".join(parts)
+
+
+def rerank_post(body):
+    """One chat completion -> its text. Separate so tests can fake it."""
+    import urllib.request
+    req = urllib.request.Request(RERANK_URL, json.dumps(body).encode(),
+                                 {"Authorization": f"Bearer {rerank_key()}", "Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=RERANK_TIMEOUT) as resp:
+        return json.load(resp)["choices"][0]["message"]["content"]
+
+
+def llm_json(prompt, model, effort):
+    body = {"model": model, "messages": [{"role": "user", "content": prompt}], "temperature": 0,
+            "response_format": {"type": "json_object"}, "provider": {"zdr": True, "data_collection": "deny"}}
+    if effort:
+        body["reasoning"] = {"effort": effort}
+    txt = rerank_post(body) or ""
+    return json.loads(txt[txt.find("{"): txt.rfind("}") + 1])
+
+
+def llm_rerank(text, rows):
+    """rows reordered by the LLM, best first; rows it left out keep their local order after the ones it ranked."""
+    order = llm_json(
+        f"Search query: {text!r}\n\nRank these videos by how well they answer the query, most relevant first. Judge "
+        "what each video is actually about, not shared words. Reply with JSON only: "
+        '{"order": [indices, best first]} including every index.\n\n'
+        + "\n\n".join(rerank_card(i, r) for i, r in enumerate(rows)), RERANK_MODEL, RERANK_EFFORT)["order"]
+    order = list(dict.fromkeys(int(i) for i in order if 0 <= int(i) < len(rows)))
+    return [rows[i] for i in order] + [r for i, r in enumerate(rows) if i not in set(order)]
+
+
+def llm_filter(text, rows):
+    """The rows the LLM grades as a full or partial match (any order). Each batch is tried twice; if one still fails
+    this raises, since a partial set would look whole. On the judged set (2026-10-06, gpt-6-luna medium) this prompt
+    kept 95% of the clearly relevant videos, 54% of the partly relevant and 2% of the irrelevant; a yes/no prompt kept
+    only 71% of the clearly relevant, and a looser "related topic counts" grade let 16% of the irrelevant through."""
+    import concurrent.futures as cf
+    def batch(start):
+        part = rows[start: start + RERANK_BATCH]
+        prompt = (f"Search query: {text!r}\n\nSomeone wants every saved video that this query should turn up, and "
+                  "nothing else. Grade each video: 2 = it is about what the query asks for; 1 = a real part of it is "
+                  "(e.g. one stop in a city vlog for a restaurant query, one dish made in a day-of-eating video for a "
+                  "recipe query); 0 = only the same general topic (a restaurant review is not a recipe, a cooking video "
+                  "is not a restaurant), unrelated, or a shared word. "
+                  'Reply with JSON only: {"grades": {"<index>": grade, ...}} listing every index.\n\n'
+                  + "\n\n".join(rerank_card(i, r) for i, r in enumerate(part)))
+        for attempt in (1, 2):
+            try:
+                grades = llm_json(prompt, FILTER_MODEL, FILTER_EFFORT)["grades"]
+                keep = {int(i) for i, g in grades.items() if int(g) >= 1 and 0 <= int(i) < len(part)}
+                return [part[i] for i in sorted(keep)]
+            except Exception:  # noqa: BLE001
+                if attempt == 2:
+                    raise
+    with cf.ThreadPoolExecutor(8) as ex:  # network-bound: the server does the work
+        return [r for got in ex.map(batch, range(0, len(rows), RERANK_BATCH)) for r in got]
+
+
+def recency_key(r):
+    return (r["date_ts"] or 0, r["chat_pos"] if r["chat_pos"] is not None else -1)
+
+
 def search(db, o):
     """-> (rows, notes). Keyword leg: rank by how many query concepts a video matches (each weighted by its IDF within
-    the searched collections), then bm25. Semantic leg: local embeddings. Hybrid fuses them by weighted RRF."""
+    the searched collections), then bm25. Semantic leg: local embeddings. Hybrid fuses them by weighted RRF. Then, when
+    configured and not o.local, an LLM reorders the top candidates (relevance) or picks the matching ones from a wider
+    pool, which are then sorted by date (o.sort newest/oldest)."""
+    rows, notes = search_local(db, o)
+    sort = getattr(o, "sort", "relevance")
+    use_llm = not getattr(o, "local", False) and rerank_ready() and o.mode != "keyword" and not o.all_terms
+    if sort == "relevance":
+        if use_llm and rows:
+            head = rows[:RERANK_TOP]
+            try:
+                rows = llm_rerank(o.text, head) + rows[RERANK_TOP:]
+                notes.append(f"reranked by {RERANK_MODEL}")
+            except Exception as e:  # noqa: BLE001 — degrade to the local order, never fail the query
+                notes.append(f"rerank unavailable ({type(e).__name__}) — local order")
+        return rows[: o.limit], notes
+    pool, local_keep = rows, getattr(o, "_local_keep", None)
+    keep = None
+    if use_llm and pool:
+        try:
+            keep = llm_filter(o.text, pool)
+            notes.append(f"{len(keep)} matches of {len(pool)} candidates, judged by {FILTER_MODEL}")
+        except Exception as e:  # noqa: BLE001
+            notes.append(f"relevance filter unavailable ({type(e).__name__}) — approximate local matches")
+    if keep is None:
+        keep = [r for r in pool if local_keep is None or r["id"] in local_keep]
+        if o.mode != "keyword" and not o.all_terms:
+            notes.append(f"{len(keep)} approximate matches (local)")
+    keep.sort(key=recency_key, reverse=sort == "newest")
+    return keep[: o.limit], notes
+
+
+def search_local(db, o):
+    """The local ranking. For a sorted query it returns the whole candidate pool (up to RERANK_POOL) instead of the
+    top o.limit, and sets o._local_keep to the ids that count as matches without the LLM."""
     notes = []
+    sorted_q = getattr(o, "sort", "relevance") != "relevance"
+    want = max(o.limit, RERANK_POOL if sorted_q else RERANK_TOP)
     where, params = filters(o)
     sc, sp = scope_sql(o)
     groups = fts_terms(o.text) or [(1.0, o.text)]
@@ -1060,22 +1227,20 @@ def search(db, o):
                 n_hit[vid] = n_hit.get(vid, 0) + 1
     except sqlite3.OperationalError as e:
         raise ValueError(f"query error: {e} (fts query was {whole!r})")
-    if o.newest:
-        rows.sort(key=lambda r: (-round(hits.get(r["id"], 0), 1), -(r["date_ts"] or 0)))
-    else:
-        rows.sort(key=lambda r: (-round(hits.get(r["id"], 0), 1), r["score"]))
+    rows.sort(key=lambda r: (-round(hits.get(r["id"], 0), 1), r["score"]))
     if o.all_terms:
         rows = [r for r in rows if n_hit.get(r["id"], 0) == len(groups)]
     if o.mode == "keyword" or o.all_terms:
-        return rows[: o.limit], notes
+        # Keyword matching is a set already: a sorted query sorts all of it.
+        return (rows if sorted_q else rows[:want]), notes
     # Semantic leg: cosine over local embeddings of the searched collections, fused with the keyword ranking by
     # weighted reciprocal rank (k=60, keyword x KW_WEIGHT), so "Katz's on the Lower East Side" answers "nyc places to
     # eat" with no shared word.
     scope_ids = [r[0] for r in db.execute(f"select v.id from videos v where {sc}", sp)]
-    sem = embed_query(o.text, k=200, ids=scope_ids)
+    sem = embed_query(o.text, k=max(200, want), ids=scope_ids)
     if sem is None:
         notes.append("semantic search unavailable — keyword results only")
-        return rows[: o.limit], notes
+        return (rows if sorted_q else rows[:want]), notes
     allowed = {r[0] for r in db.execute(f"select v.id from videos v where {' and '.join([sc, *where])}", [*sp, *params])}
     kw_rank = [r["id"] for r in rows]
     sem_rank = [i for i, _ in sem if i in allowed]
@@ -1094,11 +1259,18 @@ def search(db, o):
         exact = [r["id"] for r in rows if n_hit.get(r["id"], 0) == len(groups)]
         if len(groups) == 1 and 0 < len(exact) <= LOOKUP_MAX:
             fused = exact + [v for v in fused if v not in exact]
+    if sorted_q:
+        # Without the LLM, a match is a video with every query concept, or a semantic hit close to the best one.
+        exact = {r["id"] for r in rows if n_hit.get(r["id"], 0) == len(groups)}
+        top = sem_rank and dict(sem)[sem_rank[0]]
+        o._local_keep = exact | {i for i, s in sem if i in allowed and s >= top - LOCAL_WINDOW}
+        # The pool: every exact hit, plus the fused ranking's top `want` (so nothing literally matching is missed).
+        head, seen = fused[:want], set(fused)
+        fused = head + [v for v in fused[want:] if v in exact] + [v for v in exact if v not in seen]
+        want = len(fused)
     by_id = {r["id"]: r for r in rows}
     out = [by_id.get(vid) or db.execute("select v.*, '' as snip from videos v where id=?", (vid,)).fetchone()
-           for vid in fused[: o.limit]]
-    if o.newest:
-        out.sort(key=lambda r: -(r["date_ts"] or 0))
+           for vid in fused[:want]]
     return out, notes
 
 
@@ -1415,10 +1587,13 @@ def opts_from(p, need_text=True):
     mode = p.get("mode") or "hybrid"
     if mode not in ("hybrid", "keyword", "semantic"):
         raise ValueError("mode is hybrid, keyword or semantic")
+    sort = p.get("sort") or ("newest" if truthy(p.get("newest")) else "relevance")
+    if sort not in ("relevance", "newest", "oldest"):
+        raise ValueError("sort is relevance, newest or oldest")
     o = argparse.Namespace(
         text=text, collections=colls, limit=max(1, min(MAX_LIMIT, int(p.get("limit") or p.get("n") or 15))),
-        n=max(1, min(MAX_LIMIT, int(p.get("n") or p.get("limit") or 10))), newest=truthy(p.get("newest")),
-        all_terms=truthy(p.get("all")), mode=mode, since=p.get("since"), until=p.get("until"),
+        n=max(1, min(MAX_LIMIT, int(p.get("n") or p.get("limit") or 10))), sort=sort,
+        local=truthy(p.get("local")), all_terms=truthy(p.get("all")), mode=mode, since=p.get("since"), until=p.get("until"),
         sender=p.get("from") or p.get("sender") or "any", source=p.get("source") or "all",
         series=p.get("series"), author=p.get("author"))
     for d in (o.since, o.until):
@@ -1436,7 +1611,9 @@ OPENAPI_PARAMS = [
     ("series", "string", "one series folder, e.g. a channel name"), ("author", "string", "uploader handle or channel"),
     ("from", "string", "chat collections: who sent it (me | them | a contact name)"),
     ("source", "string", "chat collections: dm | saved | fav"),
-    ("newest", "boolean", "newest first among the top matches"), ("all", "boolean", "only videos matching every word"),
+    ("sort", "string", "relevance (default) | newest | oldest: every match, sorted by date"),
+    ("newest", "boolean", "same as sort=newest"), ("all", "boolean", "only videos matching every word"),
+    ("local", "boolean", "local models only: skip the LLM rerank and relevance filter"),
 ]
 
 
@@ -1587,8 +1764,10 @@ GUIDE = """vidrag: search downloaded videos by what they say and show (speech, c
 vision model saw), across collections such as a TikTok chat archive or YouTube channels.
 
 CLI (on the server, or through the ssh wrapper):
-  vidrag query "dog catching a frisbee"      hybrid keyword + semantic search, best first
-      -n 15  --collection a,b  --series NAME  --author NAME  --since YYYY[-MM[-DD]]  --until …  --newest
+  vidrag query "dog catching a frisbee"      hybrid keyword + semantic search, best first (an LLM reranks the top
+                                             candidates when [rerank] is configured; --local keeps it local)
+      -n 15  --collection a,b  --series NAME  --author NAME  --since YYYY[-MM[-DD]]  --until …
+      --sort newest|oldest (EVERY match, by date; --newest = --sort newest)  --local
       --mode keyword|semantic  --all (every word must match)  --from me|them|NAME  --source dm|saved|fav  --json
   vidrag recent 20 [filters]                 newest first
   vidrag show ID                             every field of one video, full transcript (JSON)
@@ -1636,7 +1815,10 @@ def main(argv=None, compat=None):
     p = sub.add_parser("query", help="search titles, captions, tags, transcripts, on-screen text and video descriptions")
     p.add_argument("text")
     p.add_argument("-n", "--limit", type=int, default=15)
-    p.add_argument("--newest", action="store_true", help="newest first among the top matches")
+    p.add_argument("--sort", choices=["relevance", "newest", "oldest"], default=None,
+                   help="newest/oldest: every match, sorted by date (default: relevance)")
+    p.add_argument("--newest", action="store_true", help="same as --sort newest")
+    p.add_argument("--local", action="store_true", help="local models only: no LLM rerank or relevance filter")
     p.add_argument("--all", dest="all_terms", action="store_true", help="only videos matching every query concept (keyword)")
     p.add_argument("--mode", choices=["hybrid", "keyword", "semantic"], default="hybrid",
                    help="hybrid (default) fuses keyword and local-embedding rankings")
@@ -1738,7 +1920,8 @@ def main(argv=None, compat=None):
     try:
         o = opts_from({"q": getattr(args, "text", ""), "collection": scope or args.collection,
                        "limit": getattr(args, "limit", None), "n": getattr(args, "n", None),
-                       "newest": getattr(args, "newest", False), "all": getattr(args, "all_terms", False),
+                       "newest": getattr(args, "newest", False), "sort": getattr(args, "sort", None),
+                       "local": getattr(args, "local", False), "all": getattr(args, "all_terms", False),
                        "mode": getattr(args, "mode", None), "since": args.since, "until": args.until,
                        "from": args.sender, "source": args.source, "series": getattr(args, "series", None),
                        "author": getattr(args, "author", None)}, need_text=args.cmd == "query")
