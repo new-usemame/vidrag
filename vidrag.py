@@ -775,6 +775,7 @@ if WATCH_BACKEND not in ("luna", "gemini"):
 WATCH_MODEL = _W.get("model") or ("openai/gpt-6-luna" if WATCH_BACKEND == "luna" else GEMINI_MODEL)
 WATCH_EFFORT = _W.get("effort", "low")
 WATCH_MAX_FRAMES = max(1, min(50, int(_W.get("max_frames", 50))))
+WATCH_REFUSAL_MODEL = _W.get("refusal_model", "google/gemini-3.8-flash" if WATCH_BACKEND == "luna" else "")
 if WATCH_BACKEND == "gemini":
     GEMINI_MODEL = WATCH_MODEL
 # API calls may overlap, but only two capped containers may prepare frames or clips at once.
@@ -1052,8 +1053,20 @@ def luna_watch_one(mp4, tdir, vid, caption, key, kind="", stop=None):
     try:
         result = luna_post(body, key)
     except WatchRefused as e:
-        rec.update(error=str(e), refused=True)
-    else:
+        # Azure's image filter refuses some harmless clips (sewing, try-ons): about 1 in 15 on a 2026-11-15 sample,
+        # more among crafts. The same frames go once to a ZDR model with a different filter.
+        result, refusal = None, str(e)
+        if WATCH_REFUSAL_MODEL:
+            check_watch_stop(stop)
+            try:
+                result = luna_post({**body, "model": WATCH_REFUSAL_MODEL,
+                                    "provider": {"zdr": True, "data_collection": "deny"}}, key)
+                rec["refused_by"] = {"model": WATCH_MODEL, "error": refusal[:300]}
+            except WatchRefused as e2:
+                refusal = str(e2)
+        if result is None:
+            rec.update(error=refusal, refused=True)
+    if result is not None:
         rec.update(model=result.get("model") or WATCH_MODEL, usage=result.get("usage") or {})
         rec["cost"] = rec["usage"].get("cost")
         choices = result.get("choices") or []

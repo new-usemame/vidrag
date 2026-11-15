@@ -576,6 +576,7 @@ class LunaWatchTest(Base):
             # Use the real transport error classifier without making a network request.
             self.t.luna_post = self.real_post
             self.t.watch_frames = self.frames
+            self.t.WATCH_REFUSAL_MODEL = ""  # no fallback: the refusal itself is recorded
             self.assertEqual(self.t.cmd_watch(ns(max=1, quiet=True)), 0)
         side = json.loads((self.tdir / "4.luna.json").read_text())
         self.assertTrue(side["refused"])
@@ -584,6 +585,27 @@ class LunaWatchTest(Base):
         (self.tdir / "4.luna.json").write_text(json.dumps(side))
         self.assertNotIn("4", {r[1] for r in self.t.watch_pending(self.t.connect())})
         self.assertTrue(all(not p.exists() for p in self.frame_dirs))
+
+    def test_refusal_falls_back_once_to_another_zdr_model(self):
+        sent = []
+
+        def post(body, key):
+            sent.append(body)
+            if len(sent) == 1:
+                raise self.t.WatchRefused("Image processing blocked due to content policy violation.")
+            return {"model": body["model"], "usage": {"cost": 0.002}, "choices": [{"finish_reason": "stop",
+                    "message": {"content": json.dumps({"summary": "A jester collar is sewn.", "tags": ["sewing"]})}}]}
+        self.t.luna_post = post
+        self.t.WATCH_REFUSAL_MODEL = "google/gemini-3.8-flash"
+        self.assertEqual(self.t.cmd_watch(ns(max=1, quiet=True)), 0)
+        self.assertEqual([b["model"] for b in sent], [self.t.WATCH_MODEL, "google/gemini-3.8-flash"])
+        self.assertEqual(sent[1]["provider"], {"zdr": True, "data_collection": "deny"})
+        self.assertEqual(sent[0]["messages"], sent[1]["messages"])
+        side = json.loads((self.tdir / "4.luna.json").read_text())
+        self.assertNotIn("error", side)
+        self.assertEqual(side["model"], "google/gemini-3.8-flash")
+        self.assertIn("refused_by", side)
+        self.assertIn("jester collar", side["description"])
 
     def test_completion_refusal_is_recorded_with_reported_cost(self):
         self.t.luna_post = lambda body, key: {"usage": {"cost": 0.0001}, "choices": [

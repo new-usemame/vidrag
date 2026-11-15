@@ -57,6 +57,7 @@ model = ""                     # empty: openai/gpt-6-luna, or [gemini].model for
 # model = "openai/gpt-6-luna"   # optional override; clear/change it when switching backends
 effort = "low"                # Luna reasoning effort
 max_frames = 50                 # Luna: hard ceiling 50; spread across the full video
+refusal_model = "google/gemini-3.8-flash"  # Luna: same frames, once, when Azure's filter refuses a clip; "" = off
 # Luna shares [rerank].key_file below; OPENROUTER_API_KEY in the environment overrides that file.
 # Collections with transcribe wait for <id>.whisper.txt (empty = no speech) before Luna watches.
 

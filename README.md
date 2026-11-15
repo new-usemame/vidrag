@@ -52,7 +52,8 @@ docker build -t vidrag-embed:2 -f asr/Dockerfile.embed2 asr
 
 Copy `config.example.toml` to `~/.config/vidrag/config.toml` and list your collections. Models for whisper.cpp and
 sherpa-onnx go in `~/vidrag/models/` (see `asr/asr.py`). Add `"watch"` to a collection's steps to enable the cloud
-watcher. The default `[watch] backend = "luna"` uses `openai/gpt-6-luna`, with `effort = "low"` and `max_frames = 50`.
+watcher. The default `[watch] backend = "luna"` uses `openai/gpt-6-luna`, with `effort = "low"` and `max_frames = 50`. Azure's image filter refuses some harmless clips (sewing, try-ons); those frames go once to
+`refusal_model` (default `google/gemini-3.8-flash`, also over ZDR), and the sidecar records `refused_by`.
 Put `OPENROUTER_API_KEY=…` in `[rerank].key_file` (mode 0600); the `OPENROUTER_API_KEY` environment variable takes
 precedence, including for a backfill with a different key. Watch works even when the reranker model is disabled.
 Every Luna request requires zero data retention and denies data collection, with routing pinned to Azure and
