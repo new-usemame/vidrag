@@ -972,7 +972,10 @@ def watch_frames(mp4, out):
     result = subprocess.run(base + [script], capture_output=True, text=True, timeout=900)
     if result.returncode:
         raise RuntimeError(f"ffmpeg frames exit {result.returncode}: {result.stderr.strip()[-200:]}")
-    return [(ts, (out / f"frame-{i:03d}.jpg").read_bytes()) for i, ts in enumerate(times)]
+    # A video track can end before the audio (the container reports the longer one), so late seeks may yield no
+    # image. Keep what was decoded; luna_watch_one rejects a clip with none.
+    return [(ts, p.read_bytes()) for i, ts in enumerate(times)
+            if (p := out / f"frame-{i:03d}.jpg").exists() and p.stat().st_size]
 
 
 class WatchRefused(Exception):

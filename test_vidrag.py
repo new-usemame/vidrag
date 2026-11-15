@@ -643,6 +643,21 @@ class LunaWatchTest(Base):
         self.assertIsNone(self.t.gemini_hold())
         self.assertTrue(json.loads((self.tdir / "4.luna.json").read_text())["refused"])
 
+    def test_frames_past_the_end_of_the_video_track_are_skipped(self):
+        import subprocess
+        def fake_run(cmd, **kw):
+            script = cmd[-1]
+            if "-frames:v" not in script:
+                return subprocess.CompletedProcess(cmd, 0, "", "Duration: 00:03:22.19, start: 0.000000")
+            out = Path(cmd[cmd.index("-v", cmd.index("-v") + 1) + 1].split(":")[0])
+            for i in range(43):  # the picture stops at frame 43; ffmpeg exits 0 with no file for the rest
+                (out / f"frame-{i:03d}.jpg").write_bytes(b"jpg")
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+        with tempfile.TemporaryDirectory() as d, patch.object(subprocess, "run", fake_run):
+            frames = self.real_frames(Path("/x.mp4"), Path(d))
+        self.assertEqual(len(frames), 43)
+        self.assertEqual(frames[0][0], 0.0)
+
     def test_three_transient_failures_stop_without_sidecars(self):
         calls = []
         def broken(body, key):
