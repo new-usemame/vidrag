@@ -12,7 +12,7 @@ home = "~/vidrag"               # off-switches: <home>/OFF stops the pipeline, <
 #   ocr         text on photo-post slides
 #   diarize     who speaks when
 #   transcribe  Whisper large-v3-turbo
-#   watch       the ONE cloud step: Gemini watches a 1-fps 480p re-encode and describes it (needs a key; costs money)
+#   watch       the ONE cloud step: Luna describes sampled frames + speech over OpenRouter ZDR (or Gemini video/audio)
 # Without steps a collection still gets titles, descriptions, tags, chapters, any subtitle files beside the videos,
 # and local embeddings.
 
@@ -51,9 +51,18 @@ model_path = "/models/fastembed/flat/embeddinggemma-300m"
 image = "vidrag-asr:3"
 cpus = 4
 
+[watch]
+backend = "luna"               # "luna" (default) or "gemini"; both honor GEMINI_OFF and .gemini-hold
+model = ""                     # empty: openai/gpt-6-luna, or [gemini].model for backend gemini
+# model = "openai/gpt-6-luna"   # optional override; clear/change it when switching backends
+effort = "low"                # Luna reasoning effort
+max_frames = 50                 # Luna: hard ceiling 50; spread across the full video
+# Luna shares [rerank].key_file below; OPENROUTER_API_KEY in the environment overrides that file.
+# Collections with transcribe wait for <id>.whisper.txt (empty = no speech) before Luna watches.
+
 [gemini]
 model = "gemini-3.5-flash-lite"
-key_file = "~/.config/vidrag/gemini.env"     # GEMINI_API_KEY=… ; no file, no cloud step
+key_file = "~/.config/vidrag/gemini.env"     # GEMINI_API_KEY=… ; used only by backend gemini
 price = [0.30, 2.50]            # $/M input, output tokens, for the spend estimate in `stats`
 
 # Optional: an LLM reorders the top search candidates and, for a date-sorted query (--sort newest), picks which

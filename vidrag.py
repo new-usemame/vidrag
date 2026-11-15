@@ -8,7 +8,7 @@ or a small HTTP API. Runs on the media server, stdlib only; the heavy steps run 
 Collections, steps and paths come from ~/.config/vidrag/config.toml ($VIDRAG_CONFIG; see config.example.toml).
 A collection is a set of series folders plus the optional steps it gets, all local unless noted:
   enrich (the platform's public page; TikTok: place tag, keywords, stickers, captions) · ocr (photo-post slides)
-  · diarize (speaker turns) · transcribe (Whisper) · watch (the one cloud step: Gemini describes the video).
+  · diarize (speaker turns) · transcribe (Whisper) · watch (the one cloud step: Luna or Gemini describes the video).
 Step outputs are sidecars beside the videos in <series>/.transcripts/<id>.*. The index is derived from them and the
 .info.json files, so deleting it and running `update` rebuilds it. `update` ends with a floor check per collection,
 so a shrunken or empty index exits non-zero instead of passing silently.
@@ -21,6 +21,7 @@ import os
 import re
 import sqlite3
 import sys
+import threading
 import time
 import tomllib
 from contextlib import closing
@@ -57,7 +58,7 @@ GEMINI_OFF = STATE / "GEMINI_OFF"  # stops only the cloud step
 HASHTAG = re.compile(r"#([^\s#.,!?;:()\[\]{}\"'’]+)")
 VIDEO_EXTS = (".mp4", ".mkv", ".webm", ".mov", ".m4v")
 SIDECAR_SUFFIXES = (".tiktok.vtt", ".whisper.txt", ".whisper.json", ".turns.json", ".ocr.txt", ".page.json",
-                    ".gemini.json")
+                    ".gemini.json", ".luna.json")
 STEPS = ("enrich", "ocr", "diarize", "transcribe", "watch")
 
 
@@ -227,11 +228,13 @@ def read_sidecars(tdir, vid):
         out["keywords"] = " · ".join(pg.get("suggestedWords") or [])
         out["topics"] = ", ".join(dict.fromkeys(pg.get("labels") or []))
         out["stickers"] = " ".join(pg.get("stickers") or [])
-    p = tdir / f"{vid}.gemini.json"
-    if p.exists():
+    for backend in ("luna", "gemini"):
         try:
-            out["visual"] = json.loads(p.read_text()).get("description") or ""
-        except ValueError:
+            rec = json.loads((tdir / f"{vid}.{backend}.json").read_text())
+            if isinstance(rec, dict) and not rec.get("error") and rec.get("description"):
+                out["visual"] = rec["description"]
+                break
+        except (OSError, ValueError):
             pass
     return out
 
@@ -757,20 +760,39 @@ def cmd_embed(args):
     return 0
 
 
-# ---------------------------------------------------------------- Gemini watches each video (the one cloud step)
-# Only collections that list "watch" in their steps, and only with a key. Nothing else is sent: one 1-fps 480p
-# re-encode + audio + the caption per video, over the stateless generateContent endpoint (the Interactions API stores
-# requests 55 days by default). Use a paid-tier key so Google does not train on it. Off: touch <home>/GEMINI_OFF.
+# ---------------------------------------------------------------- watch (the one cloud step)
+# Luna receives sampled frames, Whisper speech and the caption through OpenRouter ZDR. Gemini keeps its inline
+# video/audio path for collections that select it. Both honor <home>/GEMINI_OFF and the existing billing hold.
 
 _G = CFG.get("gemini", {})
 GEMINI_MODEL = _G.get("model", "gemini-3.5-flash-lite")
 GEMINI_KEY_FILE = expand(_G.get("key_file", HOME / ".config/vidrag/gemini.env"))
 GEMINI_PRICE = tuple(_G.get("price", (0.30, 2.50)))  # $/M input, output (thinking included)
+_W = CFG.get("watch", {})
+WATCH_BACKEND = _W.get("backend", "luna")
+if WATCH_BACKEND not in ("luna", "gemini"):
+    raise SystemExit("vidrag: watch.backend must be luna or gemini")
+WATCH_MODEL = _W.get("model") or ("openai/gpt-6-luna" if WATCH_BACKEND == "luna" else GEMINI_MODEL)
+WATCH_EFFORT = _W.get("effort", "low")
+WATCH_MAX_FRAMES = max(1, min(50, int(_W.get("max_frames", 50))))
+if WATCH_BACKEND == "gemini":
+    GEMINI_MODEL = WATCH_MODEL
+# API calls may overlap, but only two capped containers may prepare frames or clips at once.
+WATCH_EXTRACT = threading.BoundedSemaphore(2)
+
 INLINE_MAX = 14 * 2**20  # generateContent caps a request at 20 MB and base64 adds a third
 GEMINI_PROMPT = """You are indexing a {kind}video for a private search engine. Watch the video and listen to the audio.
 The uploader's caption is: {caption}
 Describe what someone would remember and search for to find this video again. Use English. Name a place, person,
 brand or dish only if it is shown, said or captioned; otherwise describe it ("a ramen shop", "a woman cooking")."""
+LUNA_PROMPT = """You are indexing a {kind}video for a private search engine. You see timestamped frames sampled across
+its whole duration, plus a transcript of its audio. Frames may omit brief events; do not invent unseen details.
+The uploader's caption is: {caption}
+Describe what someone would remember and search for to find this video again. Use English. Name a place, person,
+brand or dish only if it is shown, said or captioned; otherwise describe it ("a ramen shop", "a woman cooking").
+Describe small objects and crafts specifically: what they are, their colours, materials, shapes and how they are made
+or used (for example, small yarn figures). Return JSON matching the supplied schema.
+Whisper transcript: {transcript}"""
 GEMINI_SCHEMA = {"type": "object", "required": ["summary", "tags"], "properties": {
     "summary": {"type": "string", "description": "2-3 sentences: what happens and what the video is about"},
     "genre": {"type": "string", "description": "e.g. recipe, restaurant review, comedy skit, travel vlog, news"},
@@ -807,8 +829,13 @@ def gemini_hold():
     return h.get("reason") if time.time() < h.get("until", 0) else None
 
 
+def watch_key():
+    return rerank_key() if WATCH_BACKEND == "luna" else gemini_key()
+
+
 def gemini_ready():
-    return bool(step_colls("watch")) and bool(gemini_key()) and not GEMINI_OFF.exists() and not gemini_hold()
+    """Whether the selected watcher can run; keep the old name for pipeline callers."""
+    return bool(step_colls("watch")) and bool(watch_key()) and not GEMINI_OFF.exists() and not gemini_hold()
 
 
 def gemini_post(body, key):
@@ -867,12 +894,14 @@ def finish_reason(r):
     return (r.get("promptFeedback") or {}).get("blockReason") or (cands[0].get("finishReason") if cands else "empty")
 
 
-def watch_one(mp4, tdir, vid, caption, key, kind=""):
+def gemini_watch_one(mp4, tdir, vid, caption, key, kind="", stop=None):
     """Gemini watches one video -> <id>.gemini.json {description, raw, usage} or {error} (retried weekly)."""
     import base64
     tmp = DATA / ".watch-tmp" / f"{vid}.mp4"
     try:
-        clip = watch_clip(mp4, tmp)
+        with WATCH_EXTRACT:
+            check_watch_stop(stop)
+            clip = watch_clip(mp4, tmp)
     finally:
         tmp.unlink(missing_ok=True)
     body = {"contents": [{"parts": [
@@ -881,6 +910,7 @@ def watch_one(mp4, tdir, vid, caption, key, kind=""):
                                       caption=" ".join((caption or "(none)").split())[:1000])}]}],
         "generationConfig": {"mediaResolution": "MEDIA_RESOLUTION_LOW", "responseMimeType": "application/json",
                              "responseJsonSchema": GEMINI_SCHEMA, "thinkingConfig": {"thinkingLevel": "LOW"}}}
+    check_watch_stop(stop)
     r = gemini_post(body, key)
     if finish_reason(r) == "RECITATION":
         # Gemini withholds output that would reproduce copyrighted text (song lyrics, a script) verbatim. Ask again for
@@ -889,6 +919,7 @@ def watch_one(mp4, tdir, vid, caption, key, kind=""):
         body["generationConfig"]["responseJsonSchema"] = {**GEMINI_SCHEMA, "properties": {
             k: v for k, v in GEMINI_SCHEMA["properties"].items() if k != "on_screen_text"}}
         spent = r.get("usageMetadata") or {}
+        check_watch_stop(stop)
         r = gemini_post(body, key)
         r["usageMetadata"] = {k: v + spent.get(k, 0) if isinstance(v, int) else v  # both calls count in `stats`
                               for k, v in (r.get("usageMetadata") or {}).items()}
@@ -905,26 +936,184 @@ def watch_one(mp4, tdir, vid, caption, key, kind=""):
     return "error" not in rec, rec.get("error") or f"{len(rec['description'])} chars"
 
 
+def frame_times(duration, max_frames=50):
+    """One per second for short clips; longer clips keep both the start and the last second."""
+    if not math.isfinite(duration) or duration <= 0:
+        raise ValueError("video duration must be positive")
+    cap = max(1, min(50, int(max_frames)))
+    n = min(cap, math.ceil(duration))
+    if duration <= cap:
+        return [float(i) for i in range(n)]
+    end = max(0, duration - 1)
+    return [i * end / (n - 1) for i in range(n)] if n > 1 else [duration / 2]
+
+
+def watch_frames(mp4, out):
+    """Seek to each sample inside capped containers, so long clips do not need a full decode."""
+    import subprocess
+    out.mkdir(parents=True, exist_ok=True)
+    base = ["docker", "run", "--rm", "--cpus=2", "--memory=1g", "--cpu-shares=128",
+            "--user", f"{os.getuid()}:{os.getgid()}", "-v", f"{mp4}:/in.mp4:ro", "-v", f"{out}:/out",
+            "--entrypoint", "sh", WHISPER_IMAGE, "-c"]
+    # ffmpeg is already required by watch_clip. Check it in the image; ffprobe is not required.
+    probe = subprocess.run(base + ["command -v ffmpeg >/dev/null || exit 127; ffmpeg -hide_banner -i /in.mp4"],
+                           capture_output=True, text=True, timeout=120)
+    match = re.search(r"Duration: (\d+):(\d+):(\d+(?:\.\d+)?)", probe.stderr)
+    if not match:
+        raise RuntimeError(f"ffmpeg duration probe failed: {probe.stderr.strip()[-200:]}")
+    h, m, sec = map(float, match.groups())
+    times = frame_times(h * 3600 + m * 60 + sec, WATCH_MAX_FRAMES)
+    # mjpeg uses a 2–31 quantizer rather than JPEG's 0–100 quality scale; 16 gives compact preview JPEGs.
+    script = "set -e\n" + "\n".join(
+        f"ffmpeg -loglevel error -y -threads 1 -ss {ts:.6f} -i /in.mp4 -an "
+        f"-vf scale=-2:480 -filter_threads 1 -frames:v 1 -q:v 16 /out/frame-{i:03d}.jpg"
+        for i, ts in enumerate(times))
+    result = subprocess.run(base + [script], capture_output=True, text=True, timeout=900)
+    if result.returncode:
+        raise RuntimeError(f"ffmpeg frames exit {result.returncode}: {result.stderr.strip()[-200:]}")
+    return [(ts, (out / f"frame-{i:03d}.jpg").read_bytes()) for i, ts in enumerate(times)]
+
+
+class WatchRefused(Exception):
+    """A deterministic content-policy refusal is recorded rather than retried every week."""
+
+
+def content_refusal(value):
+    text = str(value).lower()
+    return any(word in text for word in ("content policy", "content-policy", "content_policy", "content_filter"))
+
+
+def luna_post(body, key):
+    """One ZDR chat completion; keep transport separate for offline tests."""
+    import urllib.error
+    import urllib.request
+    req = urllib.request.Request("https://openrouter.ai/api/v1/chat/completions", json.dumps(body).encode(),
+                                 {"Authorization": f"Bearer {key}", "Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=300) as response:
+            result = json.load(response)
+    except urllib.error.HTTPError as e:
+        message = f"HTTP {e.code}: {e.read().decode(errors='replace')[:1000]}"
+        if e.code in (401, 402, 403, 429):
+            raise GeminiHold(message) from None
+        if content_refusal(message):
+            raise WatchRefused(message) from None
+        raise RuntimeError(message) from None
+    error = result.get("error")
+    if error:
+        code = str(error.get("code")) if isinstance(error, dict) else ""
+        if code in ("401", "402", "403", "429"):
+            raise GeminiHold(f"HTTP {code}: {str(error)[:300]}")
+        if content_refusal(error):
+            raise WatchRefused(str(error)[:1000])
+        raise RuntimeError(str(error)[:300])
+    return result
+
+
+def check_watch_stop(stop):
+    """Queued extraction must not turn into another paid call after a hold or off switch."""
+    from concurrent.futures import CancelledError
+    if (stop is not None and stop.is_set()) or OFF.exists() or GEMINI_OFF.exists():
+        raise CancelledError()
+
+
+def luna_watch_one(mp4, tdir, vid, caption, key, kind="", stop=None):
+    """All frames share one request, so the description can reconcile the whole clip."""
+    import base64
+    import tempfile
+    tmp = DATA / ".watch-tmp"
+    tmp.mkdir(parents=True, exist_ok=True)
+    with WATCH_EXTRACT:
+        check_watch_stop(stop)
+        with tempfile.TemporaryDirectory(prefix=f"{vid}-", dir=tmp) as folder:
+            frames = watch_frames(mp4, Path(folder))
+    if not 1 <= len(frames) <= 50:
+        raise RuntimeError("Luna needs 1–50 frames")
+    speech = tdir / f"{vid}.whisper.txt"
+    transcript = speech.read_text(errors="replace").strip() if speech.exists() else ""
+    if len(transcript) > 6000:
+        transcript = transcript[:4000] + "\n[... middle omitted ...]\n" + transcript[-2000:]
+    prompt = LUNA_PROMPT.format(kind=f"{kind} " if kind else "",
+                              caption=" ".join((caption or "(none)").split())[:1000],
+                              transcript=transcript or "(no speech)")
+    content = [{"type": "text", "text": prompt}]
+    for ts, jpeg in frames:
+        content += [{"type": "text", "text": f"Frame at approximately {ts:.3f} seconds:"},
+                    {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64," +
+                     base64.b64encode(jpeg).decode(), "detail": "low"}}]
+    body = {"model": WATCH_MODEL, "messages": [{"role": "user", "content": content}],
+            "provider": {"zdr": True, "data_collection": "deny", "only": ["azure"], "allow_fallbacks": False},
+            "max_tokens": 4096, "reasoning": {"effort": WATCH_EFFORT},
+            "response_format": {"type": "json_schema", "json_schema": {
+                "name": "video_description", "strict": False, "schema": GEMINI_SCHEMA}}, "usage": {"include": True}}
+    rec = {"id": vid, "model": WATCH_MODEL, "fetched": int(time.time()), "frames": len(frames),
+           "usage": {}, "cost": None, "raw": None}
+    check_watch_stop(stop)
+    try:
+        result = luna_post(body, key)
+    except WatchRefused as e:
+        rec.update(error=str(e), refused=True)
+    else:
+        rec.update(model=result.get("model") or WATCH_MODEL, usage=result.get("usage") or {})
+        rec["cost"] = rec["usage"].get("cost")
+        choices = result.get("choices") or []
+        choice = choices[0] if choices else {}
+        message = choice.get("message") or {}
+        text = message.get("content") or ""
+        if message.get("refusal") or content_refusal(choice.get("finish_reason")):
+            rec.update(error=str(message.get("refusal") or text or "content policy refusal"), refused=True)
+        else:
+            try:
+                raw = json.loads(text)
+                if not isinstance(raw, dict) or not isinstance(raw.get("summary"), str) or not raw["summary"].strip():
+                    raise ValueError("missing summary")
+                rec.update(raw=raw, description=describe(raw))
+            except (ValueError, TypeError, AttributeError) as e:
+                if content_refusal(text):
+                    rec.update(error=str(text)[:1000], refused=True)
+                else:
+                    raise RuntimeError(f"Luna returned no usable JSON: {choice.get('finish_reason')}: {e}") from None
+    atomic_write(tdir / f"{vid}.luna.json", json.dumps(rec, ensure_ascii=False))
+    return "error" not in rec, rec.get("error") or f"{len(rec['description'])} chars"
+
+
+def watch_one(mp4, tdir, vid, caption, key, kind="", stop=None):
+    watcher = luna_watch_one if WATCH_BACKEND == "luna" else gemini_watch_one
+    return watcher(mp4, tdir, vid, caption, key, kind, stop)
+
+
 def watch_pending(db):
     """-> [(tdir, id, mp4, caption, kind)] newest first: no sidecar yet, or an error sidecar older than a week."""
     now, out = time.time(), []
     for r in step_rows(db, "watch"):
         tdir = tdir_of(r["info_path"])
-        p = tdir / f"{r['id']}.gemini.json"
+        p = tdir / f"{r['id']}.{WATCH_BACKEND}.json"
         if p.exists():
             try:
                 old = json.loads(p.read_text())
+                if not isinstance(old, dict):
+                    raise ValueError("not an object")
             except ValueError:
                 old = {"error": "corrupt", "fetched": 0}
-            if "error" not in old or now - old.get("fetched", 0) < RETRY_ERROR_AFTER:
+            usable = (bool(old.get("description")) and not old.get("error")
+                      if WATCH_BACKEND == "luna" else "error" not in old)
+            refused = old.get("refused") or (WATCH_BACKEND == "luna" and content_refusal(old.get("error")))
+            if usable or refused or (old.get("error") and now - old.get("fetched", 0) < RETRY_ERROR_AFTER):
                 continue
+        # Luna can't hear, so wait for Whisper; a .whisper.fail is final (transcribe skips it), so go without speech.
+        if (WATCH_BACKEND == "luna" and "transcribe" in COLLS[r["collection"]].steps
+                and not (tdir / f"{r['id']}.whisper.txt").exists()
+                and not (tdir / f"{r['id']}.whisper.fail").exists()):
+            continue
         if os.path.exists(r["path"]):
             out.append((tdir, r["id"], r["path"], r["caption"], COLLS[r["collection"]].kind))
     return out
 
 
 def cmd_watch(args):
-    key = gemini_key()
+    from concurrent.futures import CancelledError, ThreadPoolExecutor
+    from queue import Queue
+    key = watch_key()
     if not key or GEMINI_OFF.exists() or gemini_hold() or not step_colls("watch"):
         if not args.quiet:
             why = ("no collection has the watch step" if not step_colls("watch") else "no key" if not key
@@ -933,35 +1122,70 @@ def cmd_watch(args):
         return 0
     todo = watch_pending(connect())
     todo = todo[: args.max] if args.max else todo
+    workers = max(1, getattr(args, "workers", 1))
     if not args.quiet:
-        print(f"watch: {len(todo)} pending, model {GEMINI_MODEL}", flush=True)
-    ok = err = streak = 0
-    for tdir, vid, mp4, caption, kind in todo:
-        if OFF.exists() or GEMINI_OFF.exists():
-            break
+        print(f"watch: {len(todo)} pending, model {WATCH_MODEL}, {workers} workers", flush=True)
+    stop, hold_lock, completed = threading.Event(), threading.Lock(), Queue()
+
+    def run(row):
+        tdir, vid, mp4, caption, kind = row
         t0 = time.time()
         try:
-            good, note = watch_one(mp4, tdir, vid, caption, key, kind)
+            check_watch_stop(stop)
+            good, note = watch_one(mp4, tdir, vid, caption, key, kind, stop)
+        except CancelledError:
+            return vid, "cancelled", "", t0
         except GeminiHold as e:
-            # 402 no credits / 401-403 key / 429 quota: pause the step (6 h; 30 min for quota) instead of retrying.
-            wait = 1800 if "HTTP 429" in str(e) else 6 * 3600
-            atomic_write(DATA / ".gemini-hold", json.dumps({"until": int(time.time()) + wait, "reason": str(e)[:300]}))
-            print(f"watch: paused {wait // 60} min: {str(e)[:200]}", file=sys.stderr)
-            return 3
-        except Exception as e:  # noqa: BLE001 — transient (5xx, network, ffmpeg): no sidecar, retried next pass
+            # Set the stop in the worker, before another extractor can send a paid request.
+            with hold_lock:
+                if not gemini_hold():
+                    wait = 1800 if "HTTP 429" in str(e) else 6 * 3600
+                    atomic_write(DATA / ".gemini-hold", json.dumps({"until": int(time.time()) + wait,
+                                                                  "reason": str(e)[:300]}))
+                    print(f"watch: paused {wait // 60} min: {str(e)[:200]}", file=sys.stderr)
+                stop.set()
+            return vid, "hold", str(e), t0
+        except Exception as e:  # noqa: BLE001 — transient: no sidecar, retried next pass
             good, note = None, str(e)[:200]
-        ok += bool(good)
-        err += not good
-        streak = 0 if good is not None else streak + 1
-        if not args.quiet or good is None:
-            print(f"  {vid} {'ok' if good else 'error' if good is False else 'FAIL'} {note} ({time.time() - t0:.0f}s)",
-                  flush=True)
-        if streak >= 3:
-            print("watch: 3 transient failures in a row, stopping", file=sys.stderr)
-            return 3
+        return vid, good, note, t0
+
+    ok = err = streak = active = rc = 0
+    rows = iter(todo)
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        def submit():
+            nonlocal active
+            if stop.is_set() or OFF.exists() or GEMINI_OFF.exists():
+                return False
+            row = next(rows, None)
+            if row is None:
+                return False
+            future = pool.submit(run, row)
+            future.add_done_callback(completed.put)
+            active += 1
+            return True
+
+        for _ in range(min(workers, len(todo))):
+            submit()
+        while active:
+            vid, good, note, t0 = completed.get().result()
+            active -= 1
+            if good == "hold":
+                rc = 3
+            elif good != "cancelled":
+                ok += bool(good)
+                err += not good
+                streak = 0 if good is not None else streak + 1
+                if not args.quiet or good is None:
+                    print(f"  {vid} {'ok' if good else 'error' if good is False else 'FAIL'} {note} "
+                          f"({time.time() - t0:.0f}s)", flush=True)
+                if streak >= 3 and not stop.is_set():
+                    print("watch: 3 transient failures in a row, stopping", file=sys.stderr)
+                    stop.set()
+                    rc = 3
+            submit()
     if todo and not args.quiet:
         print(f"watch: {ok} ok, {err} errors")
-    return 0
+    return rc
 
 
 # ---------------------------------------------------------------- search
@@ -1394,7 +1618,31 @@ def gemini_stats(db, scope):
         tout += u.get("candidatesTokenCount", 0) + u.get("thoughtsTokenCount", 0)
     return {"sidecars": n, "input_tokens": tin, "output_tokens": tout,
             "est_usd": round(tin / 1e6 * GEMINI_PRICE[0] + tout / 1e6 * GEMINI_PRICE[1], 2),
-            "ready": gemini_ready(), "hold": gemini_hold(), "off": GEMINI_OFF.exists()}
+            "ready": WATCH_BACKEND == "gemini" and gemini_ready(),
+            "hold": gemini_hold(), "off": GEMINI_OFF.exists()}
+
+
+def luna_stats(db, scope):
+    """Actual dollar charges from OpenRouter; unknown costs stay visible as a separate count."""
+    n = refused = unknown = 0
+    cost = 0.0
+    names = [s for s in scope if "watch" in COLLS[s].steps]
+    rows = db.execute(f"select id, info_path from videos where collection in ({qmarks(names)})", names) if names else []
+    for r in rows:
+        try:
+            rec = json.loads((tdir_of(r["info_path"]) / f"{r['id']}.luna.json").read_text())
+        except (OSError, ValueError):
+            continue
+        n += 1
+        refused += bool(rec.get("refused"))
+        charge = rec.get("cost")
+        if isinstance(charge, (int, float)):
+            cost += charge
+        else:
+            unknown += 1
+    return {"sidecars": n, "cost_usd": round(cost, 8), "unknown_cost": unknown, "refused": refused,
+            "ready": WATCH_BACKEND == "luna" and gemini_ready(),
+            "hold": gemini_hold(), "off": GEMINI_OFF.exists()}
 
 
 def stats(db, scope, legacy=False):
@@ -1405,7 +1653,7 @@ def stats(db, scope, legacy=False):
         c = COLLS[scope[0]]
         good, msg = floor_check(db, c)
         return good, {"db": str(DB), "updated": fmt_date(int(upd), "poll") if upd else None,
-                      **c.plugin.legacy_stats(db), "gemini": gemini_stats(db, scope),
+                      **c.plugin.legacy_stats(db), "gemini": gemini_stats(db, scope), "luna": luna_stats(db, scope),
                       **c.plugin.legacy_stats_tail(db), "floor": msg}
     out = {"db": str(DB), "updated": fmt_date(int(upd), "poll") if upd else None, "collections": {}}
     for n in scope:
@@ -1419,17 +1667,19 @@ def stats(db, scope, legacy=False):
             "with_whisper_transcript": q("select count(*) from videos WHERE coalesce(transcript_whisper,'')<>''"),
             "with_speaker_turns": q("select count(*) from videos WHERE n_speakers is not null"),
             "with_ocr_or_stickers": q("select count(*) from videos WHERE coalesce(ocr,'')<>''"),
-            "watched_by_gemini": q("select count(*) from videos WHERE coalesce(visual,'')<>''"),
+            "watched_by_gemini": q("select count(*) from videos WHERE coalesce(visual,'')<>''"),  # legacy field
+            "with_visual_description": q("select count(*) from videos WHERE coalesce(visual,'')<>''"),
             "with_location": q("select count(*) from videos WHERE coalesce(location,'')<>''"),
             "steps": c.steps, "floor": msg}
     out["gemini"] = gemini_stats(db, scope)
+    out["luna"] = luna_stats(db, scope)
     return ok, out
 
 
 # ---------------------------------------------------------------- pipeline
 
 def pending_counts(db):
-    """{step: videos still to do}, from sidecar existence (a few stats per video). watch counts only while Gemini can
+    """{step: videos still to do}, from sidecar existence (a few stats per video). watch counts only while its backend can
     run (key, no GEMINI_OFF, no billing pause), so a pause cannot spin the loop."""
     out = dict.fromkeys(STEPS, 0)
     for c in COLLS.values():
@@ -1856,8 +2106,9 @@ def main(argv=None, compat=None):
     p = sub.add_parser("ocr", help="RapidOCR over photo-post slides (local, CPU-capped)")
     p.add_argument("--max", type=int, default=0)
     p.add_argument("-q", "--quiet", action="store_true")
-    p = sub.add_parser("watch", help="Gemini watches each video once (the one cloud step; only collections listing it)")
+    p = sub.add_parser("watch", help="Luna or Gemini watches each video once (the one cloud step; only collections listing it)")
     p.add_argument("--max", type=int, default=0)
+    p.add_argument("--workers", type=int, default=1, help="concurrent calls (frame extraction capped at 2)")
     p.add_argument("-q", "--quiet", action="store_true")
     p = sub.add_parser("embed", help="(re)embed changed videos with the local embedding model")
     p.add_argument("-q", "--quiet", action="store_true")

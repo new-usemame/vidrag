@@ -12,6 +12,7 @@ import urllib.error
 import urllib.request
 from contextlib import redirect_stdout
 from pathlib import Path
+from unittest.mock import patch
 
 ns = argparse.Namespace
 
@@ -58,11 +59,13 @@ class Base(unittest.TestCase):
             (yt / "TikTok DMs").mkdir()  # excluded: another collection's folder inside the same tree
         self.configure()
 
-    def configure(self, contact=None, nas=None, extra=""):
+    def configure(self, contact=None, nas=None, extra="", watch_backend="gemini"):
         nas = nas or self.nas
         cfg = f'''
 home = "{self.tmp}/state"
 data = "{self.tmp}"
+[watch]
+backend = "{watch_backend}"
 [gemini]
 key_file = "{self.tmp}/no-such-gemini.env"
 [api]
@@ -368,6 +371,350 @@ class TikTokCompatTest(Base):
         self.assertEqual(text, "S1: Welcome back.\nS2: Thanks for having me. Sure.\nS1: So, bananas.")
         text, n = self.t.speaker_transcript(w, {"n_speakers": 1, "turns": [[0, 9, 0]]})
         self.assertEqual(text, "Welcome back. Thanks for having me. Sure. So, bananas.")
+
+
+class LunaWatchTest(Base):
+    """Exercise the watcher at the request and sidecar boundary without Docker or API calls."""
+
+    def setUp(self):
+        super().setUp()
+        env = patch.dict(os.environ, {"OPENROUTER_API_KEY": "test-watch-key"})
+        env.start()
+        self.addCleanup(env.stop)
+        self.configure(watch_backend="luna", extra='\n[rerank]\nkey_file = "/no/such/file"\n')
+        self.vidrag("update", "-q")
+        self.tdir = self.nas / "TikTok DMs/.transcripts"
+        self.transcripts()
+        self.sent = []
+        self.frame_dirs = []
+        self.real_frames = self.t.watch_frames
+        self.t.watch_frames = self.frames
+        self.real_post = self.t.luna_post
+        self.t.luna_post = self.post
+
+    def transcripts(self):
+        for vid in ("1", "2", "3", "4", "9"):
+            td = self.nas / ("TikTok Saved" if vid == "9" else "TikTok DMs") / ".transcripts"
+            td.mkdir(exist_ok=True)
+            (td / f"{vid}.whisper.txt").write_text("Fold the pink yarn into a small bird.")
+
+    def frames(self, mp4, folder):
+        self.frame_dirs.append(folder)
+        (folder / "frame.jpg").write_bytes(b"jpeg")
+        return [(ts, b"jpeg") for ts in self.t.frame_times(600)]
+
+    def post(self, body, key):
+        self.sent.append((body, key))
+        return {"model": "openai/gpt-6-luna", "usage": {"prompt_tokens": 1000, "completion_tokens": 80,
+                                                        "cost": 0.0012},
+                "choices": [{"finish_reason": "stop", "message": {"content": json.dumps({
+                    "summary": "A pink yarn bird is folded by hand.", "things": ["small yarn figures"],
+                    "tags": ["craft", "pink yarn"]})}}]}
+
+    def test_frame_samples_cover_short_and_long_videos(self):
+        self.assertEqual(self.t.frame_times(30), list(range(30)))
+        times = self.t.frame_times(600)
+        self.assertEqual((len(times), times[0]), (50, 0))
+        self.assertGreaterEqual(times[-1], 599)
+        gaps = [b - a for a, b in zip(times, times[1:])]
+        self.assertLess(max(gaps) - min(gaps), 0.000001)
+        for duration in (0.1, 1, 49.5, 50, 50.1, 600):
+            for cap in (1, 10, 50, 90):
+                ts = self.t.frame_times(duration, cap)
+                self.assertTrue(1 <= len(ts) <= min(cap, 50))
+                self.assertTrue(all(0 <= v < duration for v in ts))
+        for duration in (0, -1, float("nan"), float("inf")):
+            with self.assertRaises(ValueError):
+                self.t.frame_times(duration)
+
+    def test_request_sidecar_index_and_cost(self):
+        (self.tdir / "4.gemini.json").write_text(json.dumps({"description": "old description"}))
+        self.assertEqual(self.vidrag("watch", "--max", "1", "--workers", "2", "-q")[0], 0)
+        body, key = self.sent[0]
+        self.assertEqual(len(self.sent), 1)  # one whole-video request, never concatenated batches
+        self.assertEqual(key, "test-watch-key")
+        self.assertEqual(body["provider"], {"zdr": True, "data_collection": "deny", "only": ["azure"],
+                                            "allow_fallbacks": False})
+        self.assertEqual((body["model"], body["reasoning"], body["max_tokens"]),
+                         ("openai/gpt-6-luna", {"effort": "low"}, 4096))
+        self.assertEqual(body["response_format"]["json_schema"]["schema"], self.t.GEMINI_SCHEMA)
+        content = body["messages"][0]["content"]
+        images = [p for p in content if p["type"] == "image_url"]
+        self.assertEqual(len(images), 50)
+        self.assertTrue(all(p["image_url"]["url"].startswith("data:image/jpeg;base64,") for p in images))
+        prompt = content[0]["text"]
+        self.assertIn("hidden bakery in Brooklyn", prompt)
+        self.assertIn("Fold the pink yarn", prompt)
+        self.assertIn("small objects and crafts", prompt)
+        self.assertIn("599.000 seconds", content[-2]["text"])
+        side = json.loads((self.tdir / "4.luna.json").read_text())
+        self.assertEqual((side["id"], side["model"], side["frames"], side["cost"]),
+                         ("4", "openai/gpt-6-luna", 50, 0.0012))
+        self.assertEqual(side["cost"], side["usage"]["cost"])
+        self.assertEqual(side["raw"]["things"], ["small yarn figures"])
+        self.assertIn("pink yarn bird", side["description"])
+        self.assertGreater(side["fetched"], 0)
+        self.assertTrue(all(not p.exists() for p in self.frame_dirs))
+        self.assertEqual(json.loads((self.tdir / "4.gemini.json").read_text())["description"], "old description")
+        self.assertIn("4", self.t.sidecar_mtimes(self.tdir.parent))
+        self.vidrag("update", "-q")
+        rows = json.loads(self.vidrag("query", "hand", "--mode", "keyword", "--json")[1])
+        self.assertEqual([r["id"] for r in rows], ["4"])
+        for cli in (self.vidrag, self.run_cli):
+            stats = json.loads(cli("stats")[1])
+            self.assertEqual(stats["luna"]["sidecars"], 1)
+            self.assertEqual(stats["luna"]["cost_usd"], 0.0012)
+            self.assertEqual(stats["gemini"]["sidecars"], 1)
+
+    def test_sidecar_preference_and_fallback(self):
+        (self.tdir / "4.gemini.json").write_text(json.dumps({"description": "old"}))
+        luna = self.tdir / "4.luna.json"
+        for data, expected in (({"description": "new"}, "new"),
+                               ({"error": "blocked", "description": "bad"}, "old"),
+                               ({"description": ""}, "old"), ([], "old")):
+            luna.write_text(json.dumps(data))
+            self.assertEqual(self.t.read_sidecars(self.tdir, "4")["visual"], expected)
+        luna.write_text("broken")
+        self.assertEqual(self.t.read_sidecars(self.tdir, "4")["visual"], "old")
+        luna.unlink()
+        self.assertEqual(self.t.read_sidecars(self.tdir, "4")["visual"], "old")
+
+    def test_default_backend_and_config_overrides(self):
+        cfg = self.tmp / "config.toml"
+        original = cfg.read_text()
+        cfg.write_text(original.replace('[watch]\nbackend = "luna"\n', ""))
+        importlib.reload(self.t)
+        self.assertEqual((self.t.WATCH_BACKEND, self.t.WATCH_MODEL, self.t.WATCH_EFFORT, self.t.WATCH_MAX_FRAMES),
+                         ("luna", "openai/gpt-6-luna", "low", 50))
+        cfg.write_text(original.replace('backend = "luna"',
+                                       'backend = "luna"\nmodel = "test/watcher"\neffort = "medium"\nmax_frames = 90'))
+        importlib.reload(self.t)
+        self.t.watch_frames, self.t.luna_post = self.frames, self.post
+        self.assertEqual(self.t.cmd_watch(ns(max=1, quiet=True)), 0)
+        self.assertEqual(self.t.WATCH_MAX_FRAMES, 50)
+        self.assertEqual((self.sent[0][0]["model"], self.sent[0][0]["reasoning"]),
+                         ("test/watcher", {"effort": "medium"}))
+
+    def test_frame_extractor_uses_capped_containers_and_full_duration(self):
+        import subprocess
+        self.t.WATCH_MAX_FRAMES = 50
+        out = self.tmp / "frames"
+        commands = []
+        def run(cmd, **kwargs):
+            commands.append(cmd)
+            if len(commands) == 1:
+                return ns(returncode=1, stderr="Duration: 00:10:00.00, start: 0.000000, bitrate: 100 kb/s")
+            for i in range(50):
+                (out / f"frame-{i:03d}.jpg").write_bytes(b"jpeg")
+            return ns(returncode=0, stderr="")
+        # Use the real frame extractor rather than the fixture replacement.
+        with patch.object(subprocess, "run", side_effect=run):
+            frames = self.real_frames("/video.mp4", out)
+        self.assertEqual((len(frames), frames[0], frames[-1]), (50, (0.0, b"jpeg"), (599.0, b"jpeg")))
+        for cmd in commands:
+            for cap in ("--cpus=2", "--memory=1g", "--cpu-shares=128"):
+                self.assertIn(cap, cmd)
+            self.assertEqual(cmd[cmd.index("--entrypoint") + 1], "sh")
+            self.assertEqual(cmd[-3], self.t.WHISPER_IMAGE)
+        self.assertIn("command -v ffmpeg", commands[0][-1])
+        self.assertEqual(commands[1][-1].count("-frames:v 1"), 50)
+        self.assertIn("-ss 599.000000", commands[1][-1])
+
+    def test_policy_discussion_in_valid_description_is_not_a_refusal(self):
+        self.t.luna_post = lambda body, key: {"choices": [{"message": {"content": json.dumps({
+            "summary": "A presenter explains a content policy.", "tags": ["discussion"]})}}]}
+        self.assertEqual(self.t.cmd_watch(ns(max=1, quiet=True)), 0)
+        side = json.loads((self.tdir / "4.luna.json").read_text())
+        self.assertIn("description", side)
+        self.assertNotIn("refused", side)
+
+    def test_pending_rewatches_gemini_but_keeps_refusals_and_waits_for_speech(self):
+        t = self.t
+        now = int(t.time.time())
+        for vid in ("1", "2", "3", "4"):
+            (self.tdir / f"{vid}.gemini.json").write_text(json.dumps({"description": "old"}))
+        self.assertEqual({r[1] for r in t.watch_pending(t.connect())}, {"1", "2", "3", "4", "9"})
+        # Photo posts keep the old behavior: their downloaded video is eligible too.
+        self.assertTrue(t.connect().execute("select is_photo from videos where id='3'").fetchone()[0])
+        cases = {"1": {"error": "content policy", "refused": True, "fetched": 1},
+                 "2": {"error": "old failure", "fetched": now - t.RETRY_ERROR_AFTER - 1},
+                 "3": {"error": "new failure", "fetched": now}, "4": {"description": "new"}}
+        for vid, rec in cases.items():
+            (self.tdir / f"{vid}.luna.json").write_text(json.dumps(rec))
+        saved = self.nas / "TikTok Saved/.transcripts/9.whisper.txt"
+        saved.unlink()
+        self.assertEqual([r[1] for r in t.watch_pending(t.connect())], ["2"])  # waits for its transcript
+        saved.with_suffix(".fail").write_text("failed transcription")  # final: watched without speech
+        self.assertEqual({r[1] for r in t.watch_pending(t.connect())}, {"2", "9"})
+        saved.with_suffix(".fail").unlink()
+        (self.tdir / "1.luna.json").write_text(json.dumps({"error": "content policy", "fetched": 1}))
+        self.assertEqual([r[1] for r in t.watch_pending(t.connect())], ["2"])
+        saved.write_text("")  # empty transcript is a completed no-speech result
+        self.assertEqual({r[1] for r in t.watch_pending(t.connect())}, {"2", "9"})
+        (self.tdir / "2.whisper.txt").unlink()
+        self.assertEqual([r[1] for r in t.watch_pending(t.connect())], ["9"])
+        t.COLLS["tiktok"].steps.remove("transcribe")
+        self.assertEqual({r[1] for r in t.watch_pending(t.connect())}, {"2", "9"})
+
+    def test_no_speech_and_transcript_truncation_preserve_the_ending(self):
+        speech = self.tdir / "4.whisper.txt"
+        speech.write_text("")
+        self.assertEqual(self.t.cmd_watch(ns(max=1, quiet=True)), 0)
+        self.assertIn("Whisper transcript: (no speech)", self.sent[0][0]["messages"][0]["content"][0]["text"])
+        (self.tdir / "4.luna.json").unlink()
+        speech.write_text("start " + "x" * 10000 + " final spoken words")
+        self.assertEqual(self.t.cmd_watch(ns(max=1, quiet=True)), 0)
+        prompt = self.sent[-1][0]["messages"][0]["content"][0]["text"]
+        self.assertIn("Whisper transcript: start", prompt)
+        self.assertTrue(prompt.endswith("final spoken words"))
+        self.assertIn("middle omitted", prompt)
+        self.assertLess(len(prompt), 8000)
+
+    def test_content_policy_http_refusal_is_permanent_and_cleans_frames(self):
+        with patch.object(urllib.request, "urlopen", side_effect=urllib.error.HTTPError(
+                "https://example.invalid", 400, "bad request", {}, io.BytesIO(b'Image processing blocked due to content policy violation.'))):
+            # Use the real transport error classifier without making a network request.
+            self.t.luna_post = self.real_post
+            self.t.watch_frames = self.frames
+            self.assertEqual(self.t.cmd_watch(ns(max=1, quiet=True)), 0)
+        side = json.loads((self.tdir / "4.luna.json").read_text())
+        self.assertTrue(side["refused"])
+        self.assertIn("content policy", side["error"])
+        side["fetched"] = 1
+        (self.tdir / "4.luna.json").write_text(json.dumps(side))
+        self.assertNotIn("4", {r[1] for r in self.t.watch_pending(self.t.connect())})
+        self.assertTrue(all(not p.exists() for p in self.frame_dirs))
+
+    def test_completion_refusal_is_recorded_with_reported_cost(self):
+        self.t.luna_post = lambda body, key: {"usage": {"cost": 0.0001}, "choices": [
+            {"finish_reason": "content_filter", "message": {"content": None}}]}
+        self.assertEqual(self.t.cmd_watch(ns(max=1, quiet=True)), 0)
+        side = json.loads((self.tdir / "4.luna.json").read_text())
+        self.assertTrue(side["refused"])
+        self.assertEqual(side["cost"], 0.0001)
+
+    def test_billing_and_quota_http_errors_hold_the_step(self):
+        real_post = self.real_post
+        self.t.watch_frames = self.frames
+        for code in (401, 402, 403, 429):
+            with self.subTest(code=code):
+                self.t.luna_post = real_post
+                with patch.object(urllib.request, "urlopen", side_effect=urllib.error.HTTPError(
+                        "https://example.invalid", code, "billing", {}, io.BytesIO(b"credits or quota unavailable"))):
+                    self.assertEqual(self.t.cmd_watch(ns(max=0, quiet=True)), 3)
+                self.assertIn(str(code), self.t.gemini_hold())
+                hold = json.loads((self.t.DATA / ".gemini-hold").read_text())
+                expected = 1800 if code == 429 else 21600
+                self.assertAlmostEqual(hold["until"] - self.t.time.time(), expected, delta=3)
+                self.assertEqual(self.t.pending_counts(self.t.connect())["watch"], 0)
+                self.assertFalse((self.tdir / "4.luna.json").exists())
+                (self.t.DATA / ".gemini-hold").unlink()
+
+    def test_three_transient_failures_stop_without_sidecars(self):
+        calls = []
+        def broken(body, key):
+            calls.append(body)
+            raise RuntimeError("temporary server error")
+        self.t.luna_post = broken
+        self.assertEqual(self.t.cmd_watch(ns(max=0, quiet=True, workers=1)), 3)
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(list(self.tdir.glob("*.luna.json")), [])
+        self.assertIsNone(self.t.gemini_hold())
+        self.assertEqual(len(self.t.watch_pending(self.t.connect())), 5)
+        self.assertTrue(all(not p.exists() for p in self.frame_dirs))
+
+    def test_extraction_failure_and_invalid_json_are_transient(self):
+        def broken(mp4, folder):
+            (folder / "partial.jpg").write_bytes(b"partial")
+            self.frame_dirs.append(folder)
+            raise RuntimeError("ffmpeg failed")
+        self.t.watch_frames = broken
+        self.assertEqual(self.t.cmd_watch(ns(max=1, quiet=True)), 0)
+        self.assertTrue(all(not p.exists() for p in self.frame_dirs))
+        self.assertEqual(self.sent, [])
+        self.t.watch_frames = self.frames
+        self.t.luna_post = lambda body, key: {"choices": [{"message": {"content": "not JSON"}}]}
+        self.assertEqual(self.t.cmd_watch(ns(max=1, quiet=True)), 0)
+        self.assertFalse((self.tdir / "4.luna.json").exists())
+
+    def test_workers_overlap_calls_and_cap_extraction_at_two(self):
+        lock, extracting, peak = threading.Lock(), 0, 0
+        extraction_pair, api_group = threading.Barrier(2), threading.Barrier(4)
+        def frames(mp4, folder):
+            nonlocal extracting, peak
+            with lock:
+                extracting += 1
+                peak = max(peak, extracting)
+            try:
+                extraction_pair.wait(timeout=5)
+                return [(0, b"jpeg")]
+            finally:
+                with lock:
+                    extracting -= 1
+        def post(body, key):
+            api_group.wait(timeout=5)
+            return self.post(body, key)
+        self.t.watch_frames, self.t.luna_post = frames, post
+        self.assertEqual(self.t.cmd_watch(ns(max=4, quiet=True, workers=4)), 0)
+        self.assertEqual((peak, len(self.sent)), (2, 4))
+        self.assertEqual(len(list(self.tdir.glob("*.luna.json"))), 4)
+
+    def test_concurrent_hold_prevents_waiting_extractors_from_sending(self):
+        second_started = threading.Event()
+        calls, extracting, stopping = [], [], []
+        def frames(mp4, folder):
+            extracting.append(mp4)
+            if len(extracting) > 1:
+                second_started.set()
+                self.assertTrue(stopping[0].wait(timeout=5))
+            return [(0, b"jpeg")]
+        def broke(body, key):
+            self.assertTrue(second_started.wait(timeout=5))
+            calls.append(body)
+            raise self.t.GeminiHold("HTTP 402: no credits")
+        # Capture the actual worker stop event, so the second extraction finishes after the hold.
+        original_check = self.t.check_watch_stop
+        def check(stop):
+            if stop is not None:
+                stopping.append(stop)
+            original_check(stop)
+        self.t.watch_frames, self.t.luna_post, self.t.check_watch_stop = frames, broke, check
+        self.assertEqual(self.t.cmd_watch(ns(max=0, quiet=True, workers=4)), 3)
+        self.assertEqual(len(calls), 1)
+        self.assertIn("402", self.t.gemini_hold())
+        self.assertEqual(list(self.tdir.glob("*.luna.json")), [])
+
+    def test_transient_streak_stops_concurrent_dispatch(self):
+        first_group = threading.Barrier(3)
+        calls, lock = [], threading.Lock()
+        def broken(body, key):
+            with lock:
+                calls.append(body)
+                n = len(calls)
+            if n <= 3:
+                first_group.wait(timeout=5)
+            raise RuntimeError("temporary server error")
+        # Enough rows to distinguish stopping from simply exhausting the backlog.
+        row = self.t.watch_pending(self.t.connect())[0]
+        self.t.watch_pending = lambda db: [(row[0], str(i), *row[2:]) for i in range(20)]
+        self.t.luna_post = broken
+        self.assertEqual(self.t.cmd_watch(ns(max=0, quiet=True, workers=3)), 3)
+        self.assertTrue(3 <= len(calls) <= 5)  # two other calls may already be in flight
+        self.assertEqual(list(self.tdir.glob("*.luna.json")), [])
+        self.assertIsNone(self.t.gemini_hold())
+
+    def test_off_switch_and_environment_key_override(self):
+        keyfile = self.tmp / "openrouter.env"
+        keyfile.write_text("OPENROUTER_API_KEY=file-key\n")
+        self.t.RERANK_KEY_FILE = keyfile
+        self.assertEqual(self.t.watch_key(), "test-watch-key")
+        with patch.dict(os.environ):
+            os.environ.pop("OPENROUTER_API_KEY")
+            self.assertEqual(self.t.watch_key(), "file-key")
+        self.t.GEMINI_OFF.touch()
+        self.assertEqual(self.t.pending_counts(self.t.connect())["watch"], 0)
+        self.assertEqual(self.t.cmd_watch(ns(max=0, quiet=True, workers=4)), 0)
+        self.assertEqual(self.sent, [])
 
 
 class RerankTest(Base):

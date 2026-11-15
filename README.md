@@ -6,7 +6,7 @@ the matching videos, with the file on disk and a link to the original page, from
 It indexes what yt-dlp based downloaders (MeTube, ytdl-sub, plain yt-dlp) already leave on disk:
 `<Series>/Season */<name>.info.json` beside each video. That's the same layout Jellyfin and Plex read. Point it at a
 YouTube tree, a TikTok chat archive, or anything else yt-dlp can download. Everything runs on your own server; the
-optional cloud steps (Gemini watching a video, an LLM reranking search results) are off unless you give them a key.
+optional cloud steps (Luna or Gemini describing a video, an LLM reranking search results) are off unless you give them a key.
 
 ## What it builds per video
 
@@ -18,7 +18,7 @@ optional cloud steps (Gemini watching a video, an LLM reranking search results) 
 | `transcribe` | Whisper large-v3-turbo (whisper.cpp) | local, CPU-capped container |
 | `diarize` | speaker turns (pyannote-3.0 + TitaNet via sherpa-onnx) | local, CPU-capped container |
 | `ocr` | text on photo-post slides (RapidOCR) | local, CPU-capped container |
-| `watch` | **optional cloud step:** Gemini watches a 1-fps 480p re-encode and describes it | Google Gemini API |
+| `watch` | **optional cloud step:** Luna describes timestamped frames, Whisper speech and the caption; Gemini video/audio is also available | OpenRouter ZDR (default), or Google Gemini API |
 
 At query time, an optional `[rerank]` model (any OpenRouter chat model with a zero-data-retention endpoint) reads
 short text cards of the local search's candidates: it reorders the top 30, and for `--sort newest|oldest` it decides
@@ -51,9 +51,40 @@ docker build -t vidrag-embed:2 -f asr/Dockerfile.embed2 asr
 ```
 
 Copy `config.example.toml` to `~/.config/vidrag/config.toml` and list your collections. Models for whisper.cpp and
-sherpa-onnx go in `~/vidrag/models/` (see `asr/asr.py`). For the cloud step, put `GEMINI_API_KEY=…` in the key file
-(mode 0600) and add `"watch"` to a collection's steps; `touch ~/vidrag/GEMINI_OFF` pauses it, and billing, auth and
-quota errors pause it on their own.
+sherpa-onnx go in `~/vidrag/models/` (see `asr/asr.py`). Add `"watch"` to a collection's steps to enable the cloud
+watcher. The default `[watch] backend = "luna"` uses `openai/gpt-6-luna`, with `effort = "low"` and `max_frames = 50`.
+Put `OPENROUTER_API_KEY=…` in `[rerank].key_file` (mode 0600); the `OPENROUTER_API_KEY` environment variable takes
+precedence, including for a backfill with a different key. Watch works even when the reranker model is disabled.
+Every Luna request requires zero data retention and denies data collection, with routing pinned to Azure and
+fallbacks disabled.
+
+Luna receives one request per video: up to 50 timestamped JPEG frames across the whole video, the uploader's caption,
+and up to roughly 6,000 characters of Whisper speech (the start and ending of long transcripts). Short clips get
+one frame per second; clips over 50 seconds get evenly spaced samples through the last second. Frames are 480 px tall,
+with ffmpeg MJPEG quantizer 16 for compact previews. If the collection includes `transcribe`, watch waits for its
+`.whisper.txt`, including an empty file for no speech. A `.whisper.fail` still waits: resolve transcription and retry
+it before watching. Photo posts retain the same behavior as Gemini: their downloaded video is watched if it exists.
+
+Luna writes `<series>/.transcripts/<id>.luna.json`, including the frame count and actual `usage.cost` charge. The index
+prefers a successful Luna description and falls back to the existing `.gemini.json` description after an error or
+refusal. Gemini sidecars are preserved. `vidrag stats` reports both backends' sidecar counts, Gemini's estimated spend,
+and Luna's reported `cost_usd`, refusal count and count of sidecars with unknown charges.
+
+`touch ~/vidrag/GEMINI_OFF` pauses either watcher. Billing, auth and quota errors (401, 402, 403, 429) also pause it
+through `data/.gemini-hold`: six hours, or 30 minutes for 429. Remove the hold after fixing the key or balance to
+resume sooner. Content-policy refusals are saved with `refused = true` and never retried automatically; other saved
+errors retry after a week. Transient transport, extraction or invalid-output failures write no sidecar, and three
+consecutive transient failures stop the run. Temporary frames are cleaned up under `data/.watch-tmp`.
+
+For a backfill, `vidrag watch --workers 4` overlaps API calls while keeping frame extraction at no more than two
+containers, each capped at 2 CPUs and 1 GB with low CPU shares. The default and pipeline use one worker. When a hold,
+off switch or failure streak stops a concurrent run, already-started requests finish and queued work stops. Run
+`vidrag update && vidrag embed` afterward to refresh search.
+
+To switch back, set `[watch] backend = "gemini"`, leave `[watch] model` empty (or set a Gemini model explicitly), and
+put `GEMINI_API_KEY=…` in `[gemini].key_file`. The original inline 1-fps 480p video/audio path, prompt, schema and
+recitation retry remain available. `[gemini] model` still supplies its default. Switching watchers changes which
+sidecars count as pending; existing Gemini descriptions remain available as the index fallback.
 
 ```sh
 vidrag update && vidrag embed     # index everything, then the vectors
