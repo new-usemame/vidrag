@@ -995,18 +995,18 @@ def luna_post(body, key):
             result = json.load(response)
     except urllib.error.HTTPError as e:
         message = f"HTTP {e.code}: {e.read().decode(errors='replace')[:1000]}"
+        if content_refusal(message):  # before the hold codes: a filter refusal must not pause the whole step
+            raise WatchRefused(message) from None
         if e.code in (401, 402, 403, 429):
             raise GeminiHold(message) from None
-        if content_refusal(message):
-            raise WatchRefused(message) from None
         raise RuntimeError(message) from None
     error = result.get("error")
     if error:
         code = str(error.get("code")) if isinstance(error, dict) else ""
-        if code in ("401", "402", "403", "429"):
-            raise GeminiHold(f"HTTP {code}: {str(error)[:300]}")
         if content_refusal(error):
             raise WatchRefused(str(error)[:1000])
+        if code in ("401", "402", "403", "429"):
+            raise GeminiHold(f"HTTP {code}: {str(error)[:300]}")
         raise RuntimeError(str(error)[:300])
     return result
 

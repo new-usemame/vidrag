@@ -632,6 +632,17 @@ class LunaWatchTest(Base):
                 self.assertFalse((self.tdir / "4.luna.json").exists())
                 (self.t.DATA / ".gemini-hold").unlink()
 
+    def test_http_403_content_filter_is_a_refusal_not_a_hold(self):
+        self.t.luna_post = self.real_post
+        self.t.watch_frames = self.frames
+        self.t.WATCH_REFUSAL_MODEL = ""
+        with patch.object(urllib.request, "urlopen", side_effect=urllib.error.HTTPError(
+                "https://example.invalid", 403, "Forbidden", {},
+                io.BytesIO(b'{"error": {"code": "content_filter", "message": "blocked by content policy"}}'))):
+            self.assertEqual(self.t.cmd_watch(ns(max=1, quiet=True)), 0)
+        self.assertIsNone(self.t.gemini_hold())
+        self.assertTrue(json.loads((self.tdir / "4.luna.json").read_text())["refused"])
+
     def test_three_transient_failures_stop_without_sidecars(self):
         calls = []
         def broken(body, key):
